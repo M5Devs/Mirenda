@@ -1,0 +1,30 @@
+{
+  "name": "@mirenda/sdk",
+  "version": "0.1.0",
+  "description": "Mirenda plugin SDK: typed interfaces for tabs, network, cookies, page and storage extensions.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "types": "./src/index.ts",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./manifest": "./src/manifest.ts"
+  },
+  "files": [
+    "dist",
+    "src",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "keywords": [
+    "mirenda",
+    "browser",
+    "extension",
+    "plugin"
+  ]
+}

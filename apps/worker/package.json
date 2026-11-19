@@ -1,0 +1,22 @@
+{
+  "name": "@mirenda/worker",
+  "version": "0.1.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev --port 8787 --local",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "db:migrate": "wrangler d1 migrations apply mirenda --local",
+    "db:migrate:remote": "wrangler d1 migrations apply mirenda --remote"
+  },
+  "dependencies": {
+    "@mirenda/sdk": "*"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "wrangler": "^3.101.0"
+  }
+}

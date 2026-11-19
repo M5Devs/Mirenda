@@ -1,0 +1,33 @@
+{
+  "name": "mirenda",
+  "version": "0.1.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "description": "Mobile-first cloud browser inside a browser, on Cloudflare Workers.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*",
+    "extensions/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n worker,web -c cyan,magenta \"npm:dev:worker\" \"npm:dev:web\"",
+    "dev:worker": "npm run dev -w @mirenda/worker",
+    "dev:web": "npm run dev -w @mirenda/web",
+    "build": "npm run build -w @mirenda/web && npm run build:extensions",
+    "build:extensions": "npm run build -w @mirenda/eruda-devtools",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:migrate": "npm run db:migrate -w @mirenda/worker",
+    "deploy": "npm run deploy -w @mirenda/worker"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
+  }
+}

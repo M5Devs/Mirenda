@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+apps/web/.vite/
+*.log
+coverage/
+.DS_Store
+
+# Agent working memory (local only)
+.openhands/
+
+# Go build output
+services/proxy-go/mirenda-proxyd

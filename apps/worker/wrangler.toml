@@ -1,0 +1,38 @@
+name = "mirenda"
+main = "src/index.ts"
+compatibility_date = "2025-01-15"
+compatibility_flags = ["nodejs_compat"]
+
+# The built web UI is uploaded as static assets and served for every non-API
+# path. `npm run build -w @mirenda/web` writes here before deploy.
+[assets]
+directory = "../web/dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "mirenda"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[vars]
+ENVIRONMENT = "development"
+
+[observability]
+enabled = true
+
+# Local dev: `wrangler dev --local` provisions an ephemeral D1 from migrations.
+# Production: replace database_id with the id printed by
+#   wrangler d1 create mirenda
+[env.production]
+name = "mirenda"
+
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "mirenda"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[env.production.vars]
+ENVIRONMENT = "production"

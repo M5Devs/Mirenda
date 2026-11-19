@@ -1,0 +1,19 @@
+{
+  "name": "@mirenda/eruda-devtools",
+  "version": "1.0.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "description": "Eruda mobile devtools (MIT) wrapped as a Mirenda page-runtime extension.",
+  "scripts": {
+    "build": "vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@mirenda/sdk": "*",
+    "eruda": "^3.4.1"
+  },
+  "devDependencies": {
+    "vite": "^6.0.11"
+  }
+}
