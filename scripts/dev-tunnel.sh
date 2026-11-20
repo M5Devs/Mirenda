@@ -13,15 +13,19 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-CLOUDFLARED="${CLOUDFLARED:-$(command -v cloudflared || echo /tmp/cloudflared)}"
-if [ ! -x "$CLOUDFLARED" ]; then
+CLOUDFLARED="${CLOUDFLARED:-$(command -v cloudflared || true)}"
+for candidate in "$HOME/.local/bin/cloudflared" /usr/local/bin/cloudflared /tmp/cloudflared; do
+  [ -n "$CLOUDFLARED" ] && break
+  [ -x "$candidate" ] && CLOUDFLARED="$candidate"
+done
+if [ -z "${CLOUDFLARED:-}" ] || [ ! -x "$CLOUDFLARED" ]; then
   echo "cloudflared not found. Install it or set CLOUDFLARED=/path/to/cloudflared." >&2
   exit 1
 fi
 
 APP_PORT="${APP_PORT:-8787}"
 SANDBOX_PORT="${SANDBOX_PORT:-8788}"
-LOG_DIR="${LOG_DIR:-/tmp/mirenda}"
+LOG_DIR="${LOG_DIR:-$HOME/.mirenda-dev}"
 PROXY_TOKEN_SECRET="${PROXY_TOKEN_SECRET:-dev-only-proxy-token-secret-change-me-32chars}"
 
 mkdir -p "$LOG_DIR"
