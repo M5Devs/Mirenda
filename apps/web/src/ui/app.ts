@@ -1,5 +1,8 @@
 /** The browser shell: viewport, floating chrome, and sheet wiring. */
 import { api, proxyUrl, type Tab } from '../lib/api.js';
+import { installSandboxBridge, type SandboxBridge } from '../lib/bridge.js';
+import { createRpcHandlers } from '../lib/rpc-handlers.js';
+import { openUserAgentSheet } from './user-agent-sheet.js';
 import type { Store } from '../lib/store.js';
 import { displayUrl, normalizeAddressInput, originOf } from '../lib/url.js';
 import { el, icon } from './dom.js';
@@ -26,6 +29,12 @@ export class BrowserApp {
   private historyIndex = -1;
 
   private iframe: HTMLIFrameElement | null = null;
+  private bridge!: SandboxBridge;
+  /**
+   * Cached sandbox origin from `/api/proxy-token`. `null` means same-origin:
+   * the iframe then uses a relative `/proxy` URL and needs no token at all.
+   */
+  private sandboxOrigin: string | null = null;
   private addressInput!: HTMLInputElement;
   private backButton!: HTMLButtonElement;
   private forwardButton!: HTMLButtonElement;
@@ -104,7 +113,10 @@ export class BrowserApp {
     const extensionsButton = this.iconButton('extensions', 'Extensions', () => this.openExtensions());
     this.vaultButton = this.iconButton('lock', 'Vault', () => this.openVault());
 
-    const left = el('div', { class: 'toolbar__group' }, tabsButton, profilesButton);
+    const uaButton = this.iconButton('ua', 'User-Agent', () => this.openUserAgent('tab'));
+    // Long-press is not reliable on mobile, so the sheet itself offers the
+    // profile-wide scope alongside the per-tab one.
+    const left = el('div', { class: 'toolbar__group' }, tabsButton, profilesButton, uaButton);
     const right = el('div', { class: 'toolbar__group' }, this.vaultButton, extensionsButton);
     const toolbar = el('div', { class: 'toolbar' }, left, right);
 
@@ -116,6 +128,15 @@ export class BrowserApp {
 
     root.append(viewport, loadbarSlot, statusbar, chrome, this.fab);
     this.viewportEl = viewport;
+
+    // Install the RPC bridge once. It answers nothing until `setViewport` is
+    // called with the iframe this shell created, so any other frame is ignored.
+    this.bridge = installSandboxBridge({
+      handlers: createRpcHandlers({
+        getProfileId: () => this.store.get().activeProfileId ?? '',
+      }),
+      onReject: (reason) => console.warn('sandbox bridge rejected message:', reason),
+    });
 
     this.store.subscribe((state) => this.render(state));
     void this.bootstrap();
@@ -173,11 +194,20 @@ export class BrowserApp {
     this.forwardButton.disabled = this.historyIndex >= this.history.length - 1;
   }
 
-  private renderViewport(url: string | null): void {
+  /**
+   * Render a page into the sandboxed viewport.
+   *
+   * Async because a split deployment must mint a scoped proxy token first: the
+   * sandbox origin never receives the app's session cookie, so the token is the
+   * only thing that authorises the iframe's request and every subresource the
+   * rewritten HTML points at.
+   */
+  private async renderViewport(url: string | null): Promise<void> {
     this.viewportEl.replaceChildren();
 
     if (!url || url === NEW_TAB_URL) {
       this.iframe = null;
+      this.bridge?.setViewport(null);
       this.viewportEl.append(
         el(
           'div',
@@ -189,11 +219,28 @@ export class BrowserApp {
       return;
     }
 
-    const profileId = this.store.get().activeProfileId ?? '';
+    const state = this.store.get();
+    const profileId = state.activeProfileId ?? '';
+    const tabId = state.activeTabId;
+
+    // Same-origin dev has no sandbox origin, so no token is needed. Only mint
+    // one when the proxy actually lives on another origin.
+    let token: string | null = null;
+    try {
+      const minted = await api.proxyToken(profileId);
+      this.sandboxOrigin = minted.sandboxOrigin;
+      token = minted.sandboxOrigin ? minted.token : null;
+    } catch {
+      // Without a token a split deployment cannot load the page; a same-origin
+      // deployment does not need one. Falling through keeps local dev working.
+      this.sandboxOrigin = null;
+    }
+
     const frame = el('iframe', {
-      src: proxyUrl(url, profileId),
+      src: proxyUrl(url, profileId, { token, sandboxOrigin: this.sandboxOrigin, tabId }),
       // No `allow-same-origin`: the proxied document must never share an origin
-      // with Mirenda's own UI, even though it is same-origin at the HTTP level.
+      // with Mirenda's own UI, even when it is same-origin at the HTTP level.
+      // This is what makes `event.origin` opaque inside the frame.
       sandbox: 'allow-scripts allow-forms allow-popups allow-modals allow-downloads',
       referrerpolicy: 'no-referrer',
       allow: 'fullscreen',
@@ -201,6 +248,9 @@ export class BrowserApp {
     });
     this.iframe = frame;
     this.viewportEl.append(frame);
+    // Tell the bridge which frame is trustworthy. Until this call the bridge
+    // answers nothing, so a frame created elsewhere can never reach the API.
+    this.bridge?.setViewport(frame);
   }
 
   /* -------------------------------------------------------------- actions */
@@ -224,19 +274,19 @@ export class BrowserApp {
     if (tabs.length === 0) {
       const tab = await api.createTab({ profileId, url: NEW_TAB_URL, title: 'New tab' });
       this.store.set({ tabs: [tab], activeTabId: tab.id });
-      this.renderViewport(null);
+      void this.renderViewport(null);
       return;
     }
     this.store.set({ tabs, activeTabId: tabs[0]?.id ?? null });
     const active = tabs.find((t) => t.isActive) ?? tabs[0];
-    if (active) this.renderViewport(active.url);
+    if (active) void this.renderViewport(active.url);
   }
 
   private async loadTabs(profileId: string): Promise<void> {
     const tabs = await api.listTabs(profileId);
     const active = tabs.find((t) => t.isActive) ?? tabs[0] ?? null;
     this.store.set({ tabs, activeTabId: active?.id ?? null });
-    this.renderViewport(active?.url ?? null);
+    void this.renderViewport(active?.url ?? null);
   }
 
   private navigateFromInput(): void {
@@ -255,7 +305,7 @@ export class BrowserApp {
     if (!profileId) return;
 
     this.addressInput.blur();
-    this.renderViewport(target);
+    void this.renderViewport(target);
     this.store.set({ addressValue: target, loading: true });
 
     // Truncate any forward history before pushing the new entry.
@@ -287,7 +337,7 @@ export class BrowserApp {
     if (this.historyIndex <= 0) return;
     this.historyIndex -= 1;
     const target = this.history[this.historyIndex];
-    if (target) this.renderViewport(target);
+    if (target) void this.renderViewport(target);
     this.store.set({ addressValue: target ?? '' });
   }
 
@@ -295,7 +345,7 @@ export class BrowserApp {
     if (this.historyIndex >= this.history.length - 1) return;
     this.historyIndex += 1;
     const target = this.history[this.historyIndex];
-    if (target) this.renderViewport(target);
+    if (target) void this.renderViewport(target);
     this.store.set({ addressValue: target ?? '' });
   }
 
@@ -303,7 +353,7 @@ export class BrowserApp {
     const state = this.store.get();
     const tab = state.tabs.find((t) => t.id === state.activeTabId);
     if (!tab || tab.url === NEW_TAB_URL) return;
-    this.renderViewport(tab.url);
+    void this.renderViewport(tab.url);
   }
 
   private openTabs(): void {
@@ -312,6 +362,17 @@ export class BrowserApp {
 
   private openProfiles(): void {
     openProfileSheet(this.sheetDeps());
+  }
+
+  private openUserAgent(target: 'tab' | 'profile'): void {
+    openUserAgentSheet({ store: this.store, refresh: () => this.refreshViewport() }, target);
+  }
+
+  /** Re-render the current page, e.g. after a User-Agent change. */
+  private refreshViewport(): void {
+    const state = this.store.get();
+    const tab = state.tabs.find((t) => t.id === state.activeTabId);
+    if (tab && tab.url !== NEW_TAB_URL) void this.renderViewport(tab.url);
   }
 
   private openExtensions(): void {
@@ -335,7 +396,7 @@ export class BrowserApp {
           if (!profileId) return;
           const created = await api.createTab({ profileId, url: NEW_TAB_URL, title: 'New tab' });
           this.store.set({ tabs: [...this.store.get().tabs, created], activeTabId: created.id });
-          this.renderViewport(null);
+          void this.renderViewport(null);
           return;
         }
         const profileId = this.store.get().activeProfileId;
@@ -343,7 +404,7 @@ export class BrowserApp {
           const tabs = await api.activateTab(tab.id, profileId);
           this.store.set({ tabs, activeTabId: tab.id });
         }
-        this.renderViewport(tab.url);
+        void this.renderViewport(tab.url);
         this.resetHistory(tab.url);
       },
       closeTab: async (tab) => {
@@ -354,14 +415,14 @@ export class BrowserApp {
         if (tabs.length === 0) {
           const created = await api.createTab({ profileId, url: NEW_TAB_URL, title: 'New tab' });
           this.store.set({ tabs: [created], activeTabId: created.id });
-          this.renderViewport(null);
+          void this.renderViewport(null);
           return;
         }
         const state = this.store.get();
         const stillActive = state.activeTabId !== tab.id;
         const nextActive = stillActive ? tabs.find((t) => t.id === state.activeTabId) ?? tabs[0] ?? null : tabs[0] ?? null;
         this.store.set({ tabs, activeTabId: nextActive?.id ?? null });
-        if (nextActive) this.renderViewport(nextActive.url);
+        if (nextActive) void this.renderViewport(nextActive.url);
       },
       selectProfile: async (profile) => {
         this.store.set({ activeProfileId: profile.id, tabs: [], activeTabId: null });

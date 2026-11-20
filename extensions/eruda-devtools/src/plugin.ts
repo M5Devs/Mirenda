@@ -5,7 +5,13 @@
  * entry with no exports: an injected script has no consumer to import from.
  */
 import eruda from 'eruda';
-import { definePlugin, installPageRuntime, type MirendaApi, type MirendaManifest } from '@mirenda/sdk';
+import {
+  definePlugin,
+  installPageRuntime,
+  resolveProfileId,
+  type MirendaApi,
+  type MirendaManifest,
+} from '@mirenda/sdk';
 
 export const manifest: MirendaManifest = {
   id: 'eruda-devtools',
@@ -51,19 +57,10 @@ export function bootEruda(api: MirendaApi): void {
   `);
 }
 
-/**
- * The profile id is written by the worker onto the injected script tag, so the
- * bridge calls are scoped to the profile that requested the page.
- */
-export function resolveProfileId(doc: Document = document): string {
-  const script = doc.currentScript as HTMLScriptElement | null;
-  return script?.dataset['profileId'] ?? '';
-}
-
 export function activate(): void {
   const api = installPageRuntime({
     pluginId: manifest.id,
-    profileId: resolveProfileId(),
+    profileId: resolveProfileId(manifest.id),
     url: window.location.href,
   });
   bootEruda(api);

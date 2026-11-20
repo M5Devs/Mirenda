@@ -12,3 +12,4 @@ coverage/
 
 # Go build output
 services/proxy-go/mirenda-proxyd
+apps/worker/sandbox-assets/

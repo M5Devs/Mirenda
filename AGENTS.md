@@ -112,3 +112,58 @@ construction, and exposes: `mirenda.tabs`, `mirenda.network`, `mirenda.cookies`,
 Page-runtime plugins run inside an **opaque-origin** sandboxed iframe and talk to
 the shell over `postMessage` (see `packages/sdk/src/page-runtime.ts`). Never
 assume they share an origin with the shell.
+
+## 6. Deployment roles (app / sandbox)
+
+One Worker codebase, two deployable roles selected by `WORKER_ROLE`:
+
+| Role | Serves | Refuses |
+| --- | --- | --- |
+| `app` | `/api/*` (auth, sync, vault, cookies, extensions) + the UI | `/proxy` |
+| `sandbox` | `/proxy` + `/extensions/*.js` bundles | every `/api/*`, the UI |
+| `all` | both (default; local dev only) | — |
+
+Rules that keep the split meaningful:
+
+- **A filtered route answers 404, not 403.** The sandbox must not reveal that a
+  vault or sync endpoint exists. `Router` filters by role at construction, and
+  `apps/worker/test/role-gating.test.ts` asserts that a `sandbox` router matches
+  **zero** `/api/*` routes.
+- **The sandbox publishes its own asset directory** (`apps/worker/sandbox-assets`,
+  built by `npm run build:sandbox-assets`) containing only extension bundles.
+  Never point `env.sandbox.assets` at `apps/web/dist`: that would put the login
+  screen on the origin that proxies untrusted pages — a phishing surface.
+  Missing files are a stronger guarantee than routing rules.
+- **The session cookie does not cross origins.** It is `SameSite=Lax` on the app
+  origin. `/proxy` is authorised instead by a short-lived, HMAC-signed **proxy
+  token** (`mpt1.*`, scope: one `(user, profile)`), minted by `POST /api/proxy-token`.
+  Any URL the proxy emits — rewritten `href`/`src`/`action`, and `Location`
+  redirects — must carry `pt` or navigation 401s.
+- **Never widen a token's scope.** `/proxy` treats the signed `pid` as
+  authoritative and rejects a request that names a different `profileId`.
+
+## 7. Sandbox trust boundary (shell ⇄ page)
+
+The viewport iframe is sandboxed **without** `allow-same-origin`, so its origin
+is opaque (`'null'`) and everything it sends is untrusted.
+
+- Accept a `postMessage` only if `event.source` is the exact iframe the shell
+  created. Origin alone is useless here: `'null'` is shared by every opaque
+  context on the page. Use `isTrustedViewportMessage` from `@mirenda/sdk` — do
+  not re-implement the check, so the shell and SDK cannot drift.
+- The RPC surface is an allowlist (`SANDBOX_RPC_METHODS`). It has no `auth.*`,
+  no `vault.*`, no `profiles.*`, and no `network.fetch` (a shell-brokered fetch
+  would bypass proxy cookie handling and rate limiting). Never add to it
+  without a security review.
+- Plugins resolve their profile with `resolveProfileId(manifest.id)`; the worker
+  stamps `data-profile-id` on the injected `<script>`. Never read it from
+  `document.currentScript` alone — the tag is `defer`, so it is often `null`.
+
+## 8. Rate limiting
+
+`/proxy` is the abusable surface: each request is an upstream fetch plus HTML
+rewriting. Limits live in `apps/worker/src/lib/rate-limit.ts` as a fixed window
+per `(scope, user)`. `/proxy` is per-user, so one account cannot spend another's
+budget — verified live (240 allowed, the rest 429, a second account unaffected).
+A blocked request returns 429 with `Retry-After`; successful ones carry
+`RateLimit-*` so clients can back off early.

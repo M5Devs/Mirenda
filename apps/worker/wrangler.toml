@@ -16,8 +16,21 @@ database_name = "mirenda"
 database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "migrations"
 
+# Default role for local `wrangler dev`: one Worker serving UI + proxy, which is
+# the simplest way to run the whole stack. Deploy the split roles with
+# `--env app` and `--env sandbox` (below): on `*.workers.dev` those land on
+# different registrable domains, which the Public Suffix List makes isolated.
 [vars]
 ENVIRONMENT = "development"
+WORKER_ROLE = "all"
+# Local dev secret only. Production sets this with
+#   wrangler secret put PROXY_TOKEN_SECRET --env sandbox   (and --env app)
+# The runtime enforces 32+ characters rather than trusting config.
+PROXY_TOKEN_SECRET = "dev-only-proxy-token-secret-change-me-32chars"
+# Empty in single-origin dev: the shell keeps using relative `/proxy` URLs and
+# learns the sandbox origin from /api/proxy-token when it is set.
+SANDBOX_ORIGIN = ""
+APP_ORIGIN = ""
 
 [observability]
 enabled = true
@@ -25,14 +38,77 @@ enabled = true
 # Local dev: `wrangler dev --local` provisions an ephemeral D1 from migrations.
 # Production: replace database_id with the id printed by
 #   wrangler d1 create mirenda
-[env.production]
-name = "mirenda"
+# ---------------------------------------------------------------------------
+# Split deployment: UI + auth + vault on one origin, proxy + sandbox on another.
+#
+# On `*.workers.dev` each Worker gets `<name>.<account>.workers.dev`, and
+# `workers.dev` is on the Public Suffix List — so these are genuinely separate
+# sites: no shared cookies, no shared localStorage, no shared origin. That is
+# what keeps a hostile proxied page from reaching the session or the vault.
+#
+# Both roles bind the SAME D1 database: the sandbox must read the profiles and
+# cookie jars the app writes.
+# ---------------------------------------------------------------------------
 
-[[env.production.d1_databases]]
+[env.app]
+name = "mirenda-app"
+
+[env.app.assets]
+directory = "../web/dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+[[env.app.d1_databases]]
 binding = "DB"
 database_name = "mirenda"
 database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "migrations"
 
-[env.production.vars]
+[env.app.vars]
 ENVIRONMENT = "production"
+WORKER_ROLE = "app"
+# Replace with the real Worker origins. The shell reads SANDBOX_ORIGIN from
+# /api/proxy-token, so the two must agree.
+SANDBOX_ORIGIN = "https://mirenda-sandbox.example.workers.dev"
+APP_ORIGIN = "https://mirenda-app.example.workers.dev"
+# Only the sandbox origin may call the app cross-origin.
+ALLOWED_ORIGINS = "https://mirenda-sandbox.example.workers.dev"
+# PROXY_TOKEN_SECRET is a secret (same value on both roles):
+#   wrangler secret put PROXY_TOKEN_SECRET --env app
+
+# The sandbox serves `/proxy` and the extension bundles only, and refuses
+# `/api/*` outright. It needs an ASSETS binding for the bundles, but it is
+# configured *without* the SPA fallback: a missing `.js` must 404, never return
+# `index.html` (a script tag cannot execute HTML, and the failure would be
+# silent). The app's own ASSETS binding keeps the SPA fallback for routing.
+[env.sandbox]
+name = "mirenda-sandbox"
+
+# The sandbox publishes its OWN asset directory containing only the extension
+# bundles — no `index.html`, no UI bundle. Serving the app's `dist` here would
+# put a full copy of the login screen on the origin that proxies untrusted
+# pages, which is a phishing surface. Absent files are the strongest guarantee:
+# there is no UI to leak even if routing order changes.
+#   `npm run build:sandbox-assets` populates this directory.
+[env.sandbox.assets]
+directory = "./sandbox-assets"
+binding = "ASSETS"
+not_found_handling = "none"
+# Belt and braces: every request reaches the Worker so the role gate decides.
+run_worker_first = true
+
+[[env.sandbox.d1_databases]]
+binding = "DB"
+database_name = "mirenda"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[env.sandbox.vars]
+ENVIRONMENT = "production"
+WORKER_ROLE = "sandbox"
+APP_ORIGIN = "https://mirenda-app.example.workers.dev"
+SANDBOX_ORIGIN = "https://mirenda-sandbox.example.workers.dev"
+# Only the app origin may call the sandbox cross-origin.
+ALLOWED_ORIGINS = "https://mirenda-app.example.workers.dev"
+# PROXY_TOKEN_SECRET is a secret (same value on both roles):
+#   wrangler secret put PROXY_TOKEN_SECRET --env sandbox

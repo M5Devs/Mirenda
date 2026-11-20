@@ -1,0 +1,24 @@
+{
+  "name": "@mirenda/js-css-studio",
+  "version": "1.0.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "description": "Write, save and auto-run custom JavaScript and CSS on proxied pages.",
+  "scripts": {
+    "build": "vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@codemirror/commands": "^6.7.1",
+    "@codemirror/lang-css": "^6.3.1",
+    "@codemirror/lang-javascript": "^6.2.5",
+    "@codemirror/state": "^6.5.0",
+    "@codemirror/theme-one-dark": "^6.1.2",
+    "@codemirror/view": "^6.35.0",
+    "@mirenda/sdk": "*"
+  },
+  "devDependencies": {
+    "vite": "^6.0.11"
+  }
+}

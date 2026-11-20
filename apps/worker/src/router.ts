@@ -3,7 +3,7 @@
  * `:name` segments become `ctx.params`. Authentication is a per-route flag so
  * the public auth endpoints and the authenticated API share one table.
  */
-import type { Route, RouteContext, RouteHandler } from './types.js';
+import type { Route, RouteContext, RouteHandler, WorkerRole } from './types.js';
 
 interface CompiledRoute extends Route {
   regex: RegExp;
@@ -33,8 +33,15 @@ export interface MatchResult {
 export class Router {
   private readonly routes: CompiledRoute[];
 
-  constructor(routes: readonly Route[]) {
-    this.routes = routes.map(compile);
+  /**
+   * `role` filters the table at construction so a Worker never even matches a
+   * route belonging to the other deployment role. A filtered-out route answers
+   * 404, not 403: the sandbox should not advertise that a vault endpoint exists.
+   */
+  constructor(routes: readonly Route[], role: WorkerRole = 'all') {
+    this.routes = routes
+      .filter((route) => !route.roles || route.roles.includes(role))
+      .map(compile);
   }
 
   /** Match method + pathname. Returns `null` when nothing matches. */

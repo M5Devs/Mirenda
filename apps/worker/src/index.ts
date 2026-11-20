@@ -11,13 +11,28 @@ import { findSessionUser, listEnabledExtensions } from './db/repo.js';
 import { createWorkerPluginApi } from './routes/extensions.js';
 import { createPluginRegistry, enabledPagePlugins } from './extensions/host.js';
 import { fail, json, readCookie, SESSION_COOKIE } from './lib/http.js';
+import { parseOrigins } from '@mirenda/sdk';
 import { Router } from './router.js';
 import { buildRoutes } from './routes.js';
-import type { Env, RouteContext, SessionUser } from './types.js';
+import type { Env, RouteContext, SessionUser, WorkerRole } from './types.js';
+
+/** Coerce the configured role; anything unrecognised falls back to `all`. */
+/** A genuine script bundle, as opposed to the SPA fallback's HTML shell. */
+function isScriptResponse(response: Response): boolean {
+  if (!response.ok) return false;
+  const type = response.headers.get('content-type') ?? '';
+  return /javascript|ecmascript/i.test(type);
+}
+
+function resolveRole(env: Env): WorkerRole {
+  const raw = (env.WORKER_ROLE ?? 'all').toLowerCase();
+  return raw === 'app' || raw === 'sandbox' ? raw : 'all';
+}
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    const role = resolveRole(env);
 
     if (request.method === 'OPTIONS') return preflight(request, env);
 
@@ -31,12 +46,34 @@ export default {
           );
         },
       }),
+      role,
     );
 
     const isApi = url.pathname.startsWith('/api/') || url.pathname === '/proxy';
+    // Extension bundles are static scripts injected into proxied pages. They
+    // live in the same assets directory as the UI, but the sandbox must serve
+    // them too, or every injected extension would 404 on a split deployment.
+    const isExtensionAsset = url.pathname.startsWith('/extensions/');
 
     if (!isApi) {
-      if (env.ASSETS) return env.ASSETS.fetch(request);
+      const servesAssets = isExtensionAsset || role !== 'sandbox';
+      // Only the app role serves the UI itself; the sandbox serves just the
+      // extension bundles and must not become a second copy of the app.
+      if (servesAssets && env.ASSETS) {
+        const asset = await env.ASSETS.fetch(request);
+        // The app's ASSETS binding uses the SPA fallback, so a missing bundle
+        // would come back as `index.html` with a 200. A `<script src>` cannot
+        // execute HTML and the page would fail silently, so an extension asset
+        // must be a real script or a 404.
+        if (isExtensionAsset && !isScriptResponse(asset)) return fail(404, 'not found');
+        return withCors(asset, request, env);
+      }
+      return fail(404, 'not found');
+    }
+
+    // A sandbox deployment answers nothing but `/proxy`. Refusing `/api/*` here,
+    // before the router, keeps the boundary obvious even if the table changes.
+    if (role === 'sandbox' && !url.pathname.startsWith('/proxy')) {
       return fail(404, 'not found');
     }
 
@@ -60,12 +97,12 @@ export default {
 
     try {
       const response = await Router.handler(match)(context);
-      return withSecurityHeaders(response);
+      return withCors(withSecurityHeaders(response), request, env);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'unexpected error';
       // Log the message only; request bodies and secrets are never echoed.
       console.error('route failure', { path: url.pathname, message });
-      return withSecurityHeaders(fail(500, 'internal error'));
+      return withCors(withSecurityHeaders(fail(500, 'internal error')), request, env);
     }
   },
 } satisfies ExportedHandler<Env>;
@@ -92,17 +129,37 @@ function withSecurityHeaders(response: Response): Response {
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
+/**
+ * Add CORS headers when the caller is an explicitly allowlisted origin.
+ *
+ * Never `*`: authenticated routes depend on a scoped allowlist, and reflecting
+ * an arbitrary origin with credentials would let any site read the API. When the
+ * origin is absent (same-origin navigation) no header is needed.
+ */
+function withCors(response: Response, request: Request, env: Env): Response {
+  const origin = request.headers.get('origin');
+  if (!origin) return response;
+  const allowed = parseOrigins(env.ALLOWED_ORIGINS);
+  if (!allowed.includes(origin.trim().replace(/\/+$/, '').toLowerCase())) return response;
+
+  const headers = new Headers(response.headers);
+  headers.set('access-control-allow-origin', origin);
+  headers.set('access-control-allow-credentials', 'true');
+  headers.append('vary', 'origin');
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
 function preflight(request: Request, env: Env): Response {
   const origin = request.headers.get('origin') ?? '';
-  const allowed = (env.ALLOWED_ORIGINS ?? '')
-    .split(',')
-    .map((value) => value.trim())
-    .filter(Boolean);
+  const allowed = parseOrigins(env.ALLOWED_ORIGINS);
   const headers = new Headers({ 'access-control-allow-methods': 'GET,POST,PATCH,DELETE,OPTIONS' });
-  headers.set('access-control-allow-headers', 'content-type');
+  headers.set('access-control-allow-headers', 'content-type, x-mirenda-proxy-token');
   headers.set('access-control-allow-credentials', 'true');
   headers.set('vary', 'origin');
   // Never answer `*`: authenticated endpoints rely on a scoped origin allowlist.
-  if (allowed.includes(origin)) headers.set('access-control-allow-origin', origin);
+  const normalized = origin.trim().replace(/\/+$/, '').toLowerCase();
+  if (normalized !== '' && allowed.includes(normalized)) {
+    headers.set('access-control-allow-origin', origin);
+  }
   return new Response(null, { status: 204, headers });
 }

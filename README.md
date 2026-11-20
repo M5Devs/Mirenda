@@ -65,10 +65,12 @@ or missing UI until you build once.
 | `npm run dev` | Worker (`:8787`) + Vite (`:5173`) together. |
 | `npm run dev:worker` | Worker only. |
 | `npm run dev:web` | Vite only. |
-| `npm run build` | Web UI, then the extension bundle. |
-| `npm run build:extensions` | Rebuild only the Eruda bundle. |
+| `npm run build` | Web UI, then all extension bundles, then the sandbox asset copy. |
+| `npm run build:web` | Build the mobile UI only. |
+| `npm run build:extensions` | Rebuild the Eruda, cookie-manager and js/css-studio bundles. |
+| `npm run build:sandbox-assets` | Copy **only** the bundles into `apps/worker/sandbox-assets`. |
 | `npm run typecheck` | `tsc --noEmit` across every workspace. |
-| `npm test` | Vitest: URL rewriter, cookie jar, crypto, URL parsing, SDK. |
+| `npm test` | Vitest: URL rewriter, cookie jar, crypto, rate limit, proxy token, bridge, SDK. |
 | `npm run db:migrate` | Apply `migrations/*.sql` to the local D1. |
 | `npm run deploy` | Deploy the worker to Cloudflare. |
 
@@ -83,6 +85,24 @@ npx wrangler d1 migrations apply mirenda --remote
 
 Put the printed id into both `database_id` fields in `wrangler.toml`, then
 `npm run deploy`.
+
+### Two-role deployment (recommended)
+
+The same Worker runs as two roles, selected by `WORKER_ROLE`:
+
+```bash
+npm run build
+npx wrangler deploy --env app        # /api/* + UI
+npx wrangler deploy --env sandbox    # /proxy + extension bundles only
+npx wrangler secret put PROXY_TOKEN_SECRET --env app
+npx wrangler secret put PROXY_TOKEN_SECRET --env sandbox   # same value
+```
+
+Set `APP_ORIGIN` / `SANDBOX_ORIGIN` / `ALLOWED_ORIGINS` in each env. The sandbox
+gets a session-free `/proxy` through short-lived HMAC proxy tokens, publishes
+only extension bundles (no UI, so it cannot host a phishing login), and answers
+404 to every `/api/*` route. Local dev uses `WORKER_ROLE=all`, one Worker
+serving both — the same code paths, one process.
 
 ## How the proxy works
 
@@ -111,6 +131,11 @@ Responses carry `x-mirenda-proxied: 1`.
 | Site passwords | Sealed client-side (`PBKDF2` 310k → `AES-GCM`); D1 stores ciphertext + IV only. |
 | Session theft from a DB leak | Sessions store only the SHA-256 of the token. |
 | Hostile proxied markup | Viewport iframe is sandboxed **without** `allow-same-origin`. |
+| Forged sandbox messages | Accepted only from the exact viewport frame (`event.source`), not by origin. |
+| Compromised page reaching auth/vault | RPC is an allowlist: no `auth.*`, `vault.*`, `profiles.*`, or `network.fetch`. |
+| Credential abuse / proxy flooding | Per-user fixed-window limits; 429 + `Retry-After`. |
+| Sandbox origin used for phishing | Sandbox ships no UI at all — only extension bundles. |
+| Cross-origin session reuse | `/proxy` uses a scoped 5-minute HMAC token, not the session cookie. |
 | Password timing | Verification uses a constant-time comparison. |
 
 The vault key is held in memory only. Reloading the page locks the vault; unlock
@@ -119,8 +144,16 @@ with your master password to derive the same key from the server-issued salt.
 ## Extensions
 
 ```bash
-npm run build:extensions   # rebuild extensions/eruda-devtools
+npm run build:extensions   # rebuild all three bundles
 ```
+
+Ships with three built-ins:
+
+| Extension | What it adds |
+| --- | --- |
+| `eruda-devtools` | Mobile console, elements, network and cookie inspector. |
+| `cookie-manager` | View, edit, delete and export/import the virtual jar per site. |
+| `js-css-studio` | Per-domain JS/CSS snippets with auto-run, plus three utilities. |
 
 Toggle extensions per profile in the drawer. Enablement is stored server-side,
 so the proxy injects only what the active profile has switched on.

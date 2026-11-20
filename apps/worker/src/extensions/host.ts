@@ -32,6 +32,22 @@ export const BUILTIN_EXTENSIONS: readonly ExtensionRecord[] = [
     entry: '/extensions/eruda-devtools.js',
     matches: ['*'],
   },
+  {
+    id: 'cookie-manager',
+    name: 'Cookie Manager',
+    version: '1.0.0',
+    description: 'Inspect, edit, export and import cookies for the current site in this profile.',
+    entry: '/extensions/cookie-manager.js',
+    matches: ['*'],
+  },
+  {
+    id: 'js-css-studio',
+    name: 'JS & CSS Studio',
+    version: '1.0.0',
+    description: 'Write, save and auto-run custom JavaScript and CSS on proxied pages.',
+    entry: '/extensions/js-css-studio.js',
+    matches: ['*'],
+  },
 ];
 
 /**

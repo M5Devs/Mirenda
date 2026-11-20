@@ -17,13 +17,15 @@
     "dev": "concurrently -n worker,web -c cyan,magenta \"npm:dev:worker\" \"npm:dev:web\"",
     "dev:worker": "npm run dev -w @mirenda/worker",
     "dev:web": "npm run dev -w @mirenda/web",
-    "build": "npm run build -w @mirenda/web && npm run build:extensions",
-    "build:extensions": "npm run build -w @mirenda/eruda-devtools",
+    "build": "npm run build:web && npm run build:extensions && npm run build:sandbox-assets",
+    "build:extensions": "npm run build -w @mirenda/eruda-devtools && npm run build -w @mirenda/cookie-manager && npm run build -w @mirenda/js-css-studio",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "vitest run",
     "test:watch": "vitest",
     "db:migrate": "npm run db:migrate -w @mirenda/worker",
-    "deploy": "npm run deploy -w @mirenda/worker"
+    "deploy": "npm run deploy -w @mirenda/worker",
+    "build:sandbox-assets": "rm -rf apps/worker/sandbox-assets && mkdir -p apps/worker/sandbox-assets && cp -R apps/web/dist/extensions apps/worker/sandbox-assets/extensions",
+    "build:web": "npm run build -w @mirenda/web"
   },
   "devDependencies": {
     "concurrently": "^9.1.2",

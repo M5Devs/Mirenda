@@ -26,6 +26,12 @@ import type {
 export interface BridgeRequest {
   channel: 'mirenda-rpc';
   id: number;
+  /**
+   * The plugin making the call. The shell uses it to scope `storage` to one
+   * namespace; the worker validates it against the built-in catalog, so a page
+   * cannot invent a namespace, only address a real built-in plugin's.
+   */
+  pluginId: string;
   method: string;
   params: unknown;
 }
@@ -67,6 +73,13 @@ export interface PageRuntimeOptions {
   timeoutMs?: number;
   /** The window to install onto; defaults to the global. */
   target?: MirendaWindowLike;
+  /**
+   * Origin of the Mirenda shell. Defaults to `'*'`, which is safe because the
+   * payload is a request, never a secret: the shell validates `event.source`
+   * before answering and never replies with credentials. Set this when the
+   * shell's origin is known so the browser can drop the message early.
+   */
+  shellOrigin?: string;
 }
 
 interface Pending {
@@ -104,10 +117,17 @@ export function installPageRuntime(options: PageRuntimeOptions): MirendaApi {
         reject(new Error(`mirenda bridge timed out: ${method}`));
       }, timeoutMs);
       pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timer });
-      const request: BridgeRequest = { channel: 'mirenda-rpc', id, method, params };
-      // `*` is safe here: the payload is a request, never a secret, and the shell
-      // validates the sender window before answering.
-      target.parent.postMessage(request, '*');
+      const request: BridgeRequest = {
+        channel: 'mirenda-rpc',
+        id,
+        pluginId: options.pluginId,
+        method,
+        params,
+      };
+      // The shell validates `event.source` before answering and never replies
+      // with credentials, so a wildcard target is safe. When the shell origin is
+      // known, pass it so the browser drops the message for any other frame.
+      target.parent.postMessage(request, options.shellOrigin ?? '*');
     });
   }
 
@@ -240,4 +260,39 @@ function createPageApi(target: MirendaWindowLike, initialUrl: string): MirendaAp
       };
     },
   };
+}
+
+/**
+ * Resolve the profile id the worker wrote onto the injected `<script>` tag.
+ *
+ * `document.currentScript` is unreliable here: the tag carries `defer`, so by
+ * the time a plugin's module body runs the parser may have moved on and
+ * `currentScript` is `null`. Fall back to scanning for this plugin's own tag,
+ * which is unambiguous because `data-mirenda-plugin` is the manifest id.
+ *
+ * Returns `''` when nothing matches — the shell then reports "no active
+ * profile" rather than scoping a call to the wrong container.
+ */
+export function resolveProfileId(
+  pluginId: string,
+  // Structural types rather than DOM lib types: the SDK is also imported from
+  // Node (tests, worker) where `lib.dom` is not loaded.
+  doc: {
+    currentScript?: unknown;
+    querySelector(selector: string): unknown;
+  } = (globalThis as unknown as { document: { currentScript?: unknown; querySelector(s: string): unknown } })
+    .document,
+): string {
+  const readProfileId = (node: unknown): string => {
+    const dataset = (node as { dataset?: Record<string, string> } | null)?.dataset;
+    const value = dataset?.['profileId'];
+    return typeof value === 'string' ? value : '';
+  };
+
+  const fromCurrent = readProfileId(doc.currentScript);
+  if (fromCurrent !== '') return fromCurrent;
+
+  // `data-mirenda-plugin` is the manifest id, so this tag is unambiguous.
+  const escaped = pluginId.replace(/["\\]/g, '\\$&');
+  return readProfileId(doc.querySelector(`script[data-mirenda-plugin="${escaped}"]`));
 }

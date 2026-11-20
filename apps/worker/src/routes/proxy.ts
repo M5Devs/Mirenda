@@ -9,7 +9,9 @@ import {
   parseSetCookie,
   readSetCookies,
 } from '../proxy/cookie-jar.js';
-import { loadJar, saveJar } from '../db/repo.js';
+import { findTab, incrementRateLimit, loadJar, saveJar } from '../db/repo.js';
+import { proxyTokenFromRequest, verifyProxyToken } from '../auth/proxy-token.js';
+import { decideRateLimit, rateLimitedResponse, rateLimitHeaders } from '../lib/rate-limit.js';
 import { buildHandlers, createRewriteState } from '../proxy/rewrite-handlers.js';
 import {
   parseProxyTarget,
@@ -75,16 +77,50 @@ export interface ProxyDeps {
 export function createProxyHandler(deps: ProxyDeps) {
   return async function proxyRoute(ctx: RouteContext): Promise<Response> {
     const { request, env, url } = ctx;
-    const user = ctx.user;
-    if (!user) return fail(401, 'not authenticated');
+
+    // Two ways to authorise a proxied request:
+    //   1. a live session cookie (same-origin deployment), or
+    //   2. a scoped proxy token (split deployment, where the session cookie is
+    //      SameSite=Lax on the app origin and never reaches this origin).
+    // A token only authorises `/proxy` for its own (user, profile); it cannot
+    // reach any /api route.
+    const token = proxyTokenFromRequest(url, request.headers);
+    let userId: string | null = ctx.user?.id ?? null;
+    let profileId = url.searchParams.get('profileId') ?? '';
+
+    if (!userId && token) {
+      const secret = env.PROXY_TOKEN_SECRET;
+      if (!secret) return fail(503, 'proxy tokens are not configured');
+      const verified = await verifyProxyToken(secret, token);
+      if (!verified.ok) {
+        return fail(verified.reason === 'expired' ? 401 : 403, `invalid proxy token: ${verified.reason}`);
+      }
+      userId = verified.claims.sub;
+      // The token's profile is authoritative: a caller must not widen it.
+      if (profileId && profileId !== verified.claims.pid) {
+        return fail(403, 'proxy token does not cover this profile');
+      }
+      profileId = verified.claims.pid;
+    }
+
+    if (!userId) return fail(401, 'not authenticated');
 
     const target = parseProxyTarget(url.searchParams.get('url'));
     if (!target) return fail(400, 'url must be an absolute http(s) URL');
 
-    const profileId = url.searchParams.get('profileId') ?? '';
     if (!profileId) return fail(400, 'profileId is required');
-    const profile = await findOwnedProfile(env.DB, user.id, profileId);
+    const profile = await findOwnedProfile(env.DB, userId, profileId);
     if (!profile) return fail(404, 'profile not found');
+
+    // ---- rate limit ---------------------------------------------------------
+    // Counted per account (not per profile) so spinning up profiles cannot
+    // multiply the allowance. Headers ride on every response, including 429.
+    const nowMs = Date.now();
+    const pre = decideRateLimit('proxy', userId, 0, nowMs);
+    const used = await incrementRateLimit(env.DB, pre.bucketKey, pre.windowStart);
+    const limit = decideRateLimit('proxy', userId, used, nowMs);
+    if (!limit.allowed) return rateLimitedResponse(limit);
+    const limitHeaders = rateLimitHeaders(limit);
 
     const targetDomain = targetDomainOf(target);
 
@@ -94,6 +130,15 @@ export function createProxyHandler(deps: ProxyDeps) {
       if (FORWARDED_REQUEST_HEADERS.has(name.toLowerCase())) outgoing.set(name, value);
     }
     if (profile.user_agent) outgoing.set('user-agent', profile.user_agent);
+
+    // A per-tab override wins over the profile default so one tab can present a
+    // different client without changing the whole container. Only the active
+    // tab for this profile is consulted; an unknown tabId is simply ignored.
+    const tabId = url.searchParams.get('tabId') ?? '';
+    if (tabId) {
+      const tab = await findTab(env.DB, profileId, tabId);
+      if (tab?.user_agent) outgoing.set('user-agent', tab.user_agent);
+    }
     // Never leak the target's own `Referer` to a third party through the proxy.
     const referer = request.headers.get('referer');
     if (referer) {
@@ -106,11 +151,11 @@ export function createProxyHandler(deps: ProxyDeps) {
       }
     }
 
-    const jar = await loadJar(env.DB, { userId: user.id, profileId, domain: targetDomain });
+    const jar = await loadJar(env.DB, { userId, profileId, domain: targetDomain });
     const outgoingCookies = cookiesForRequest(jar, target);
     if (outgoingCookies.length > 0) outgoing.set('cookie', buildCookieHeader(outgoingCookies));
 
-    const registry = await deps.createRegistry(user, profileId);
+    const registry = await deps.createRegistry({ id: userId, email: ctx.user?.email ?? '' }, profileId);
 
     let proxiedRequest = {
       url: target,
@@ -150,7 +195,7 @@ export function createProxyHandler(deps: ProxyDeps) {
       if (received.length > 0) {
         await saveJar(
           env.DB,
-          { userId: user.id, profileId, domain: targetDomain },
+          { userId, profileId, domain: targetDomain },
           mergeCookies(jar, received),
         );
       }
@@ -161,6 +206,10 @@ export function createProxyHandler(deps: ProxyDeps) {
     if (upstream.status >= 300 && upstream.status < 400 && location) {
       const resolved = new URL(location, proxiedRequest.url).toString();
       const params = new URLSearchParams({ url: resolved, profileId });
+      // The token must survive the redirect. In a split deployment the browser
+      // follows this Location to the sandbox origin, which has no session
+      // cookie — without `pt` every redirect would land on a 401.
+      if (token) params.set('pt', token);
       const headers = new Headers({ location: `${PROXY_PATH}?${params.toString()}`, 'cache-control': 'no-store' });
       return new Response(null, { status: upstream.status, headers });
     }
@@ -172,6 +221,7 @@ export function createProxyHandler(deps: ProxyDeps) {
     }
     responseHeaders.delete('content-encoding');
     responseHeaders.set('x-mirenda-proxied', '1');
+    for (const [name, value] of Object.entries(limitHeaders)) responseHeaders.set(name, value);
     // The proxied document is hostile; never let it set a cookie on our origin.
     responseHeaders.delete('set-cookie');
 
@@ -194,7 +244,11 @@ export function createProxyHandler(deps: ProxyDeps) {
     const injections: PageInjection[] = proxiedResponse.injections;
 
     // ---- body rewriting -----------------------------------------------------
-    const rewriteCtx: RewriteContext = { pageUrl: proxiedRequest.url, profileId };
+    const rewriteCtx: RewriteContext = {
+      pageUrl: proxiedRequest.url,
+      profileId,
+      ...(token ? { proxyToken: token } : {}),
+    };
 
     if (!isHtml) {
       if (isCss) {

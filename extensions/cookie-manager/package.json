@@ -1,0 +1,18 @@
+{
+  "name": "@mirenda/cookie-manager",
+  "version": "1.0.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "description": "Cookie inspector and editor for the active profile and proxied domain.",
+  "scripts": {
+    "build": "vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@mirenda/sdk": "*"
+  },
+  "devDependencies": {
+    "vite": "^6.0.11"
+  }
+}

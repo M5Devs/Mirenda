@@ -17,7 +17,13 @@ import {
   setExtensionEnabled,
   updateTab,
 } from '../db/repo.js';
-import { cookiesForRequest, mergeCookies, parseSetCookie, readSetCookies } from '../proxy/cookie-jar.js';
+import {
+  cookiesForRequest,
+  mergeCookies,
+  parseSetCookie,
+  readSetCookies,
+  type JarCookie,
+} from '../proxy/cookie-jar.js';
 import { fail, json, readJsonObject } from '../lib/http.js';
 import { extensionCatalog, isBuiltinExtension } from '../extensions/host.js';
 import type { Env, RouteContext } from '../types.js';
@@ -310,4 +316,234 @@ export async function toggleExtension({ request, user, env, url }: RouteContext)
 
   const enabled = await setExtensionEnabled(env.DB, profile.id, extensionId, body.enabled);
   return json({ extensionId, enabled: enabled.includes(extensionId), enabledExtensions: enabled });
+}
+
+/* ------------------------------------------------------------------ cookies */
+/*
+ * HTTP surface for the cookie-manager extension. It is the same Virtual Cookie
+ * Jar the proxy uses, reached through the session (or the extension's own RPC
+ * bridge), never by exposing the jar as a raw HTTP API. HttpOnly rows are
+ * filtered out on read and cannot be minted on write — that flag stays owned by
+ * the server, per AGENTS.md §3.2.
+ */
+
+/** `GET /api/cookies?profileId=&domain=` — non-HttpOnly cookies for one domain. */
+export async function getCookies({ user, env, url }: RouteContext): Promise<Response> {
+  if (!user) return fail(401, 'not authenticated');
+  const profileId = url.searchParams.get('profileId') ?? '';
+  const profile = await findOwnedProfile(env.DB, user.id, profileId);
+  if (!profile) return fail(404, 'profile not found');
+  const domain = (url.searchParams.get('domain') ?? '').trim().toLowerCase();
+  if (domain === '') return fail(400, 'domain is required');
+
+  const cookies = await listVisibleCookies(env, user.id, profile.id, domain);
+  return json({ domain, cookies });
+}
+
+/** `POST /api/cookies` with `{ profileId, domain, cookie }` — create or replace. */
+export async function upsertCookie({ request, user, env }: RouteContext): Promise<Response> {
+  if (!user) return fail(401, 'not authenticated');
+  const body = await readJsonObject(request);
+  if (!body) return fail(400, 'expected a JSON object');
+
+  const profileId = typeof body.profileId === 'string' ? body.profileId : '';
+  const profile = await findOwnedProfile(env.DB, user.id, profileId);
+  if (!profile) return fail(404, 'profile not found');
+
+  const domain = typeof body.domain === 'string' ? body.domain.trim().toLowerCase() : '';
+  if (domain === '') return fail(400, 'domain is required');
+
+  const cookie = body.cookie;
+  if (typeof cookie !== 'object' || cookie === null || Array.isArray(cookie)) {
+    return fail(400, 'cookie must be an object');
+  }
+  const c = cookie as Record<string, unknown>;
+  const name = typeof c.name === 'string' ? c.name.trim() : '';
+  const value = typeof c.value === 'string' ? c.value : '';
+  if (name === '') return fail(400, 'cookie.name is required');
+  if (name.length > 256) return fail(400, 'cookie.name is too long');
+  if (value.length > 4096) return fail(400, 'cookie.value is too long');
+
+  const path = typeof c.path === 'string' && c.path.startsWith('/') ? c.path : '/';
+  const expires = typeof c.expires === 'number' && Number.isFinite(c.expires) ? c.expires : undefined;
+  const secure = typeof c.secure === 'boolean' ? c.secure : true;
+  const sameSite =
+    c.sameSite === 'Strict' || c.sameSite === 'Lax' || c.sameSite === 'None' ? c.sameSite : undefined;
+
+  const key = { userId: user.id, profileId: profile.id, domain };
+  const jar = await loadJar(env.DB, key);
+  const next = mergeCookies(jar, [
+    {
+      name,
+      value,
+      domain,
+      path,
+      ...(expires !== undefined ? { expires } : {}),
+      // The user-facing manager cannot create HttpOnly rows.
+      httpOnly: false,
+      secure,
+      ...(sameSite ? { sameSite } : {}),
+    },
+  ]);
+  await saveJar(env.DB, key, next);
+
+  const cookies = await listVisibleCookies(env, user.id, profile.id, domain);
+  return json({ domain, cookies });
+}
+
+/** `DELETE /api/cookies?profileId=&domain=&name=` — remove one cookie. */
+export async function deleteCookie({ user, env, url }: RouteContext): Promise<Response> {
+  if (!user) return fail(401, 'not authenticated');
+  const profileId = url.searchParams.get('profileId') ?? '';
+  const profile = await findOwnedProfile(env.DB, user.id, profileId);
+  if (!profile) return fail(404, 'profile not found');
+
+  const domain = (url.searchParams.get('domain') ?? '').trim().toLowerCase();
+  const name = (url.searchParams.get('name') ?? '').trim();
+  if (domain === '' || name === '') return fail(400, 'domain and name are required');
+
+  const key = { userId: user.id, profileId: profile.id, domain };
+  const jar = await loadJar(env.DB, key);
+  await saveJar(env.DB, key, jar.filter((cookie) => cookie.name !== name));
+
+  const cookies = await listVisibleCookies(env, user.id, profile.id, domain);
+  return json({ domain, cookies });
+}
+
+/**
+ * `POST /api/cookies/import` with `{ profileId, domain, cookies: [...] }`.
+ *
+ * Import is a merge, not a replace: existing cookies for names the payload does
+ * not mention are kept, matching how a browser restores an exported jar. Every
+ * row is validated and `httpOnly` is forced off, so a hand-edited export cannot
+ * smuggle an HttpOnly flag into the jar.
+ */
+export async function importCookies({ request, user, env }: RouteContext): Promise<Response> {
+  if (!user) return fail(401, 'not authenticated');
+  const body = await readJsonObject(request);
+  if (!body) return fail(400, 'expected a JSON object');
+
+  const profileId = typeof body.profileId === 'string' ? body.profileId : '';
+  const profile = await findOwnedProfile(env.DB, user.id, profileId);
+  if (!profile) return fail(404, 'profile not found');
+
+  const domain = typeof body.domain === 'string' ? body.domain.trim().toLowerCase() : '';
+  if (domain === '') return fail(400, 'domain is required');
+
+  const raw = body.cookies;
+  if (!Array.isArray(raw)) return fail(400, 'cookies must be an array');
+  if (raw.length > 200) return fail(400, 'too many cookies in one import');
+
+  const incoming = raw
+    .map((entry): JarCookie | null => {
+      if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) return null;
+      const e = entry as Record<string, unknown>;
+      const name = typeof e.name === 'string' ? e.name.trim() : '';
+      const value = typeof e.value === 'string' ? e.value : '';
+      if (name === '' || name.length > 256 || value.length > 4096) return null;
+      const path = typeof e.path === 'string' && e.path.startsWith('/') ? e.path : '/';
+      const expires = typeof e.expires === 'number' && Number.isFinite(e.expires) ? e.expires : undefined;
+      const sameSite =
+        e.sameSite === 'Strict' || e.sameSite === 'Lax' || e.sameSite === 'None' ? e.sameSite : undefined;
+      return {
+        name,
+        value,
+        domain,
+        path,
+        ...(expires !== undefined ? { expires } : {}),
+        httpOnly: false,
+        secure: typeof e.secure === 'boolean' ? e.secure : true,
+        ...(sameSite ? { sameSite } : {}),
+      };
+    })
+    .filter((cookie): cookie is JarCookie => cookie !== null);
+
+  if (incoming.length === 0) return fail(400, 'no valid cookies in payload');
+
+  const key = { userId: user.id, profileId: profile.id, domain };
+  const jar = await loadJar(env.DB, key);
+  await saveJar(env.DB, key, mergeCookies(jar, incoming));
+
+  const cookies = await listVisibleCookies(env, user.id, profile.id, domain);
+  return json({ domain, imported: incoming.length, cookies });
+}
+
+/* ------------------------------------------------------------ plugin storage */
+/*
+ * Per-plugin, per-profile key/value storage, exposed over HTTP so a page-runtime
+ * plugin can persist through the shell bridge. The worker plugin API already has
+ * an in-process `storage`, but a plugin running inside the sandboxed page has no
+ * way to reach it — hence this endpoint.
+ *
+ * `pluginId` is validated against the built-in catalog: an arbitrary id would
+ * let a page write into another plugin's namespace.
+ */
+
+async function readStorage(env: Env, profileId: string, pluginId: string): Promise<Record<string, unknown>> {
+  const row = await env.DB.prepare('SELECT value FROM plugin_storage WHERE profile_id = ? AND plugin_id = ?')
+    .bind(profileId, pluginId)
+    .first<{ value: string }>();
+  if (!row) return {};
+  try {
+    const parsed: unknown = JSON.parse(row.value);
+    return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+async function writeStorage(env: Env, profileId: string, pluginId: string, data: Record<string, unknown>): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO plugin_storage (profile_id, plugin_id, value, updated_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT (profile_id, plugin_id) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+  )
+    .bind(profileId, pluginId, JSON.stringify(data), new Date().toISOString())
+    .run();
+}
+
+/** Resolve `(profileId, pluginId)` from a request body, or return an error. */
+async function resolveStorageScope(
+  env: Env,
+  userId: string,
+  profileId: string,
+  pluginId: string,
+): Promise<Response | null> {
+  if (!isBuiltinExtension(pluginId)) return fail(404, 'unknown plugin');
+  const profile = await findOwnedProfile(env.DB, userId, profileId);
+  if (!profile) return fail(404, 'profile not found');
+  return null;
+}
+
+/** `GET /api/plugin-storage?profileId=&pluginId=` — the whole namespace. */
+export async function getPluginStorage({ user, env, url }: RouteContext): Promise<Response> {
+  if (!user) return fail(401, 'not authenticated');
+  const profileId = url.searchParams.get('profileId') ?? '';
+  const pluginId = url.searchParams.get('pluginId') ?? '';
+  const error = await resolveStorageScope(env, user.id, profileId, pluginId);
+  if (error) return error;
+  return json({ data: await readStorage(env, profileId, pluginId) });
+}
+
+/**
+ * `POST /api/plugin-storage` with `{ profileId, pluginId, key, value }`.
+ * `value: null` removes the key, matching the storage API's `remove`.
+ */
+export async function setPluginStorage({ request, user, env }: RouteContext): Promise<Response> {
+  if (!user) return fail(401, 'not authenticated');
+  const body = await readJsonObject(request);
+  if (!body) return fail(400, 'expected a JSON object');
+
+  const profileId = typeof body.profileId === 'string' ? body.profileId : '';
+  const pluginId = typeof body.pluginId === 'string' ? body.pluginId : '';
+  const error = await resolveStorageScope(env, user.id, profileId, pluginId);
+  if (error) return error;
+
+  const key = typeof body.key === 'string' ? body.key.trim() : '';
+  if (key === '' || key.length > 256) return fail(400, 'key must be 1..256 characters');
+
+  const data = await readStorage(env, profileId, pluginId);
+  if (body.value === null) delete data[key];
+  else data[key] = body.value;
+  await writeStorage(env, profileId, pluginId, data);
+  return json({ data });
 }

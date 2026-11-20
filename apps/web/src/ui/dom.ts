@@ -52,7 +52,8 @@ export type IconName =
   | 'close'
   | 'lock'
   | 'unlock'
-  | 'shield';
+  | 'shield'
+  | 'ua';
 
 type Path = readonly [string, boolean?];
 
@@ -72,4 +73,9 @@ const PATHS: Record<IconName, readonly Path[]> = {
   lock: [['M7 11V8a5 5 0 0110 0v3'], ['M6 11h12v10H6z']],
   unlock: [['M7 11V8a5 5 0 019.6-2'], ['M6 11h12v10H6z']],
   shield: [['M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z']],
+  ua: [
+    ['M3 5h18v11H3z'],
+    ['M8 20h8'],
+    ['M12 16v4'],
+  ],
 };

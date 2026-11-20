@@ -770,3 +770,41 @@ body {
 .statusbar__domain--error {
   color: var(--danger, #ff5c6c);
 }
+
+/* ---- User-Agent switcher ------------------------------------------------ */
+/* Chips are one-tap targets: 44px minimum height for thumbs. */
+.ua-chips {
+  display: grid;
+  gap: 8px;
+  margin: 4px 0 12px;
+}
+
+.ua-chip {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 0 14px;
+  border: 1px solid var(--border, #2a2f3a);
+  border-radius: 12px;
+  background: var(--surface-2, #171b23);
+  color: var(--text, #e8ecf3);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ua-chip--active {
+  border-color: var(--accent, #4f8cff);
+  background: color-mix(in srgb, var(--accent, #4f8cff) 16%, transparent);
+}
+
+.ua-chip__label {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.ua-divider {
+  height: 1px;
+  margin: 14px 0;
+  background: var(--border, #2a2f3a);
+}

@@ -12,6 +12,16 @@ export interface RewriteContext {
   profileId: string;
   /** Override for tests or alternate mounts. */
   proxyPath?: string;
+  /**
+   * Scoped proxy token to carry on every rewritten URL.
+   *
+   * A proxied document fans out into dozens of subresource requests (`src`,
+   * `href`, `srcset`, CSS `url()`), and in a split deployment each of those is a
+   * fresh request to the sandbox origin with no session cookie. Without the
+   * token on the rewritten URL every subresource would be refused, so the token
+   * is threaded through the same rewrite that produces the URL.
+   */
+  proxyToken?: string;
 }
 
 /**
@@ -50,6 +60,7 @@ export function resolveTargetUrl(raw: string, base: string): string | null {
 export function proxify(target: string, ctx: RewriteContext): string {
   const path = ctx.proxyPath ?? PROXY_PATH;
   const params = new URLSearchParams({ url: target, profileId: ctx.profileId });
+  if (ctx.proxyToken) params.set('pt', ctx.proxyToken);
   return `${path}?${params.toString()}`;
 }
 

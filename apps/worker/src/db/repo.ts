@@ -25,6 +25,7 @@ export interface ProfileRow {
 }
 
 export interface TabRow {
+  user_agent?: string | null;
   id: string;
   profile_id: string;
   url: string;
@@ -233,7 +234,7 @@ export async function findTab(db: D1Database, profileId: string, tabId: string):
 
 export async function insertTab(
   db: D1Database,
-  input: { profileId: string; url: string; title: string },
+  input: { profileId: string; url: string; title: string; userAgent?: string | null },
 ): Promise<TabRow> {
   const existing = await db
     .prepare('SELECT COALESCE(MAX(position), -1) + 1 AS next FROM tabs WHERE profile_id = ?')
@@ -247,12 +248,22 @@ export async function insertTab(
     is_active: 0,
     position: existing?.next ?? 0,
     updated_at: now(),
+    user_agent: input.userAgent ?? null,
   };
   await db
     .prepare(
-      'INSERT INTO tabs (id, profile_id, url, title, is_active, position, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO tabs (id, profile_id, url, title, is_active, position, updated_at, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
     )
-    .bind(row.id, row.profile_id, row.url, row.title, row.is_active, row.position, row.updated_at)
+    .bind(
+      row.id,
+      row.profile_id,
+      row.url,
+      row.title,
+      row.is_active,
+      row.position,
+      row.updated_at,
+      row.user_agent ?? null,
+    )
     .run();
   return row;
 }
@@ -261,7 +272,7 @@ export async function updateTab(
   db: D1Database,
   profileId: string,
   tabId: string,
-  patch: { url?: string; title?: string; isActive?: boolean; position?: number },
+  patch: { url?: string; title?: string; isActive?: boolean; position?: number; userAgent?: string | null },
 ): Promise<void> {
   const sets: string[] = [];
   const values: unknown[] = [];
@@ -280,6 +291,10 @@ export async function updateTab(
   if (patch.position !== undefined) {
     sets.push('position = ?');
     values.push(patch.position);
+  }
+  if (patch.userAgent !== undefined) {
+    sets.push('user_agent = ?');
+    values.push(patch.userAgent);
   }
   if (sets.length === 0) return;
   sets.push('updated_at = ?');
@@ -582,3 +597,34 @@ export async function setExtensionEnabled(
     .run();
   return next;
 }
+
+// ---- rate limiting ---------------------------------------------------------
+// One counter row per (scope, subject, window). The atomic UPSERT returns the
+// post-increment value, so concurrent requests cannot both observe "0 used" and
+// let a burst through. Old windows are pruned opportunistically.
+
+/**
+ * Increment the counter for `bucketKey` and return the value *before* this
+ * request. Returning the pre-increment count lets the caller decide with the
+ * same number it will report, and keeps the decision logic pure.
+ */
+export async function incrementRateLimit(db: D1Database, bucketKey: string, windowStart: number): Promise<number> {
+  const row = await db
+    .prepare(
+      `INSERT INTO rate_limit_buckets (bucket_key, counter, window_start, updated_at)
+       VALUES (?, 1, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+       ON CONFLICT (bucket_key)
+       DO UPDATE SET counter = counter + 1, updated_at = excluded.updated_at
+       RETURNING counter`,
+    )
+    .bind(bucketKey, windowStart)
+    .first<{ counter: number }>();
+  // `counter` is post-increment; the caller wants the pre-increment value.
+  return Math.max(0, (row?.counter ?? 1) - 1);
+}
+
+/** Drop buckets whose window ended before `beforeMs`. Best-effort housekeeping. */
+export async function pruneRateLimitBuckets(db: D1Database, beforeMs: number): Promise<void> {
+  await db.prepare('DELETE FROM rate_limit_buckets WHERE window_start < ?').bind(beforeMs).run();
+}
+
