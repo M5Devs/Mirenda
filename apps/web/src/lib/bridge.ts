@@ -133,10 +133,27 @@ async function dispatch(
   }
 }
 
+/**
+ * A diagnostic report from the proxied frame.
+ *
+ * The runtime shim forwards uncaught errors and rejections over `postMessage`
+ * because the shell cannot read the frame's console. The shell only ever shows
+ * this as a transient toast — it is untrusted text from a hostile page, so it
+ * is rendered as text, never HTML.
+ */
+export interface FrameErrorReport {
+  kind: string;
+  message: string;
+  detail: string | null;
+  pageUrl: string;
+}
+
 export interface BridgeOptions {
   handlers: SandboxRpcHandlers;
   /** Called for every rejected message, for diagnostics. Never logs payloads. */
   onReject?: (reason: string) => void;
+  /** Called for uncaught errors reported by the trusted viewport. */
+  onFrameError?: (report: FrameErrorReport) => void;
 }
 
 export interface SandboxBridge {
@@ -157,7 +174,28 @@ export function installSandboxBridge(options: BridgeOptions): SandboxBridge {
 
   const listener = (event: MessageEvent): void => {
     const data = event.data as Partial<RpcRequest> | null;
-    if (!data || typeof data !== 'object' || data.channel !== 'mirenda-rpc') return;
+    if (!data || typeof data !== 'object') return;
+
+    // Frame diagnostics ride a separate channel. Same trust rule applies: only
+    // the viewport this shell created may report, so a hostile page cannot use
+    // the toast to spoof a reassuring (or alarming) message.
+    if ((data as { channel?: unknown }).channel === 'mirenda-frame-error') {
+      const contentWindow = viewport?.contentWindow ?? null;
+      if (!isTrustedViewportMessage({ source: event.source, origin: event.origin }, contentWindow)) {
+        options.onReject?.('untrusted frame-error source');
+        return;
+      }
+      const report = data as unknown as Partial<FrameErrorReport>;
+      options.onFrameError?.({
+        kind: typeof report.kind === 'string' ? report.kind : 'error',
+        message: typeof report.message === 'string' ? report.message : 'unknown',
+        detail: typeof report.detail === 'string' ? report.detail : null,
+        pageUrl: typeof report.pageUrl === 'string' ? report.pageUrl : '',
+      });
+      return;
+    }
+
+    if (data.channel !== 'mirenda-rpc') return;
 
     // Rule 1: only the viewport we created. Shared with the SDK so the shell
     // and any other consumer of the trust boundary cannot drift apart.

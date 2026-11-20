@@ -149,3 +149,38 @@ describe('Router matching details', () => {
     expect(router.match('GET', '/x/api/profiles')).toBeNull();
   });
 });
+
+/**
+ * The sandbox serves the extension bundles that the proxy injects into proxied
+ * pages. Only the app role used to serve assets, so a split deployment answered
+ * 404 for every injected `<script>` and extensions silently never booted.
+ */
+describe('sandbox extension assets', () => {
+  it('lets the sandbox serve /extensions/* even though it serves no UI', () => {
+    const isExtensionAsset = (pathname: string) => pathname.startsWith('/extensions/');
+    const servesAssets = (pathname: string, role: 'app' | 'sandbox') =>
+      isExtensionAsset(pathname) || role !== 'sandbox';
+
+    expect(servesAssets('/extensions/eruda-devtools.js', 'sandbox')).toBe(true);
+    expect(servesAssets('/index.html', 'sandbox')).toBe(false);
+    expect(servesAssets('/', 'sandbox')).toBe(false);
+    expect(servesAssets('/index.html', 'app')).toBe(true);
+  });
+
+  it('rejects a non-script response so an SPA fallback cannot mask a missing bundle', () => {
+    // The app's ASSETS binding answers a missing file with index.html and a 200.
+    // A `<script src>` cannot execute HTML, so the route must not pass it on.
+    const isScriptResponse = (response: Response): boolean => {
+      if (!response.ok) return false;
+      return /javascript|ecmascript/i.test(response.headers.get('content-type') ?? '');
+    };
+
+    const html = new Response('<!doctype html>', { headers: { 'content-type': 'text/html' } });
+    const js = new Response('console.log(1)', { headers: { 'content-type': 'application/javascript' } });
+    const missing = new Response('not found', { status: 404 });
+
+    expect(isScriptResponse(html)).toBe(false);
+    expect(isScriptResponse(js)).toBe(true);
+    expect(isScriptResponse(missing)).toBe(false);
+  });
+});

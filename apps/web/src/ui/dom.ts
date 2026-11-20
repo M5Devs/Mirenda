@@ -53,7 +53,11 @@ export type IconName =
   | 'lock'
   | 'unlock'
   | 'shield'
-  | 'ua';
+  | 'ua'
+  | 'bolt'
+  | 'zen'
+  | 'search'
+  | 'trash';
 
 type Path = readonly [string, boolean?];
 
@@ -78,4 +82,13 @@ const PATHS: Record<IconName, readonly Path[]> = {
     ['M8 20h8'],
     ['M12 16v4'],
   ],
+  bolt: [['M13 2L4.5 13.5H11l-1 8.5 8.5-11.5H12z']],
+  zen: [
+    ['M4 9V5.5A1.5 1.5 0 015.5 4H9'],
+    ['M15 4h3.5A1.5 1.5 0 0120 5.5V9'],
+    ['M20 15v3.5a1.5 1.5 0 01-1.5 1.5H15'],
+    ['M9 20H5.5A1.5 1.5 0 014 18.5V15'],
+  ],
+  search: [['M11 4a7 7 0 100 14 7 7 0 000-14z'], ['M20 20l-4.2-4.2']],
+  trash: [['M4 7h16'], ['M9 7V5h6v2'], ['M6 7l1 13h10l1-13']],
 };

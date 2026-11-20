@@ -21,30 +21,29 @@ export function openTabSheet(deps: SheetDeps): void {
   const { store } = deps;
   const state = store.get();
   const sheet = openSheet({ title: `Tabs (${state.tabs.length})`, onClose: () => undefined });
+  const tint = state.profiles.find((p) => p.id === state.activeProfileId)?.color ?? '#ff7a18';
+  const profileName = state.profiles.find((p) => p.id === state.activeProfileId)?.name ?? 'Profile';
 
-  const list = el('ul', { class: 'list' });
+  // Cards rather than rows: a 2-up grid lets a thumb reach any tab without
+  // scrolling and shows a page's title at a glance, the way mobile browsers do.
+  const grid = el('div', { class: 'tabgrid' });
 
   for (const tab of state.tabs) {
     const active = tab.id === state.activeTabId;
-    const item = el(
-      'li',
-      {},
-      el(
-        'button',
-        {
-          class: `list__item${active ? ' list__item--active' : ''}`,
-          type: 'button',
-        },
-        el(
-          'span',
-          { class: 'list__main' },
-          el('span', { class: 'list__title', text: tab.title || displayUrl(tab.url) || 'New tab' }),
-          el('span', { class: 'list__sub', text: displayUrl(tab.url) }),
-        ),
-      ),
+    const card = el('button', {
+      class: `tabcard${active ? ' tabcard--active' : ''}`,
+      type: 'button',
+      style: `--tab-tint:${tint}`,
+      'aria-label': `Switch to ${tab.title || tab.url}`,
+    });
+    const tag = el('span', { class: 'tabcard__tag' }, el('i', {}), document.createTextNode(profileName));
+    card.append(
+      tag,
+      el('span', { class: 'tabcard__title', text: tab.title || displayUrl(tab.url) || 'New tab' }),
+      el('span', { class: 'tabcard__url', text: displayUrl(tab.url) || 'about:newtab' }),
     );
 
-    item.querySelector('button')!.addEventListener('click', () => {
+    card.addEventListener('click', () => {
       void (async () => {
         await deps.openTab(tab);
         sheet.close();
@@ -52,7 +51,7 @@ export function openTabSheet(deps: SheetDeps): void {
     });
 
     const closeButton = el('button', {
-      class: 'iconbtn',
+      class: 'tabcard__close',
       type: 'button',
       'aria-label': `Close ${tab.title || tab.url}`,
     });
@@ -64,22 +63,20 @@ export function openTabSheet(deps: SheetDeps): void {
         sheet.close();
       })();
     });
-    item.querySelector('button')!.after(closeButton);
-
-    list.append(item);
+    card.append(closeButton);
+    grid.append(card);
   }
 
-  if (state.tabs.length === 0) list.append(el('li', { class: 'empty', text: 'No open tabs.' }));
-
-  const newTab = el('button', { class: 'button button--primary', type: 'button' });
-  newTab.append(icon('plus'), document.createTextNode('New tab'));
-  newTab.addEventListener('click', () => {
+  const newCard = el('button', { class: 'tabcard tabcard--new', type: 'button', 'aria-label': 'New tab' });
+  newCard.append(icon('plus'), el('span', { class: 'tabcard__title', text: 'New tab' }));
+  newCard.addEventListener('click', () => {
     sheet.close();
-    deps.store.set({ addressValue: '' });
+    store.set({ addressValue: '' });
     void deps.openTab({ id: '', profileId: state.activeProfileId ?? '', url: 'about:newtab', title: '', isActive: true, position: 0, updatedAt: '' });
   });
+  grid.append(newCard);
 
-  sheet.body.append(list, newTab);
+  sheet.body.append(grid);
 }
 
 /* ---------------------------------------------------------- profile sheet */

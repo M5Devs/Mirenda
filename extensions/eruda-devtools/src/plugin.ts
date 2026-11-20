@@ -50,6 +50,24 @@ export function bootEruda(api: MirendaApi): void {
 
   api.page.notify('Eruda DevTools ready — tap the eruda button', 'info');
 
+  // Eruda parks its floating button in the bottom-right corner, exactly where
+  // Mirenda's address pill floats, so the button would be unreachable. Lift it
+  // above the pill (pill is ~58px tall + 14px gap) on both initial placement
+  // and every resize, since eruda resets to the corner on resize.
+  const PILL_CLEARANCE = 96;
+  const placeEntryButton = () => {
+    const entry = eruda.get('entryBtn');
+    if (!entry) return;
+    const button = document.querySelector('#eruda')?.shadowRoot?.querySelector('.eruda-entry-btn');
+    const size = button?.getBoundingClientRect().width ?? 40;
+    entry.setPos({
+      x: Math.max(0, window.innerWidth - size - 10),
+      y: Math.max(0, window.innerHeight - size - 10 - PILL_CLEARANCE),
+    });
+  };
+  placeEntryButton();
+  window.addEventListener('resize', placeEntryButton);
+
   // Keep the panel above the proxied page's own fixed chrome.
   api.page.injectStyle(`
     .eruda-container { z-index: 2147483600 !important; }

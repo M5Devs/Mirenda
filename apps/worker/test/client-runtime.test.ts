@@ -275,3 +275,288 @@ describe('client runtime: storage fallback', () => {
     expect(w.localStorage.getItem('before')).toBe('kept');
   });
 });
+
+/**
+ * An opaque-origin frame (sandbox without `allow-same-origin`) throws
+ * SecurityError on cookie/storage/IDB/Cache/serviceWorker access. These tests
+ * model that by making the native accessors throw, then assert the shim keeps
+ * page code running instead of aborting.
+ *
+ * The behaviour was measured in Chromium: `document.cookie`, `localStorage`,
+ * `sessionStorage`, `indexedDB.open()`, `caches` (property access) and
+ * `navigator.serviceWorker` all throw, while `BroadcastChannel` works.
+ */
+function makeOpaque(w: Window): void {
+  Object.defineProperty(w, 'origin', { configurable: true, get: () => 'null' });
+  Object.defineProperty(w.Document.prototype, 'cookie', {
+    configurable: true,
+    get() {
+      throw new w.DOMException('blocked', 'SecurityError');
+    },
+    set() {
+      throw new w.DOMException('blocked', 'SecurityError');
+    },
+  });
+  Object.defineProperty(w, 'localStorage', {
+    configurable: true,
+    get() {
+      throw new w.DOMException('blocked', 'SecurityError');
+    },
+  });
+  Object.defineProperty(w, 'sessionStorage', {
+    configurable: true,
+    get() {
+      throw new w.DOMException('blocked', 'SecurityError');
+    },
+  });
+  Object.defineProperty(w, 'caches', {
+    configurable: true,
+    get() {
+      throw new w.DOMException('blocked', 'SecurityError');
+    },
+  });
+}
+
+function installOpaque(): Window {
+  const w = new Window({ url: PAGE });
+  makeOpaque(w);
+  w.eval(buildClientRuntimeScript(CFG));
+  return w;
+}
+
+describe('client runtime: opaque origin detection', () => {
+  it('reports whether the frame is opaque', () => {
+    expect(install().__mirendaRuntime.opaque).toBe(false);
+    expect(installOpaque().__mirendaRuntime.opaque).toBe(true);
+  });
+});
+
+describe('client runtime: document.cookie shim', () => {
+  it('does not throw when the page reads or writes cookies', () => {
+    const w = installOpaque();
+    expect(() => {
+      w.document.cookie = 'a=1';
+    }).not.toThrow();
+    expect(w.document.cookie).toBe('a=1');
+  });
+
+  it('keeps several cookies and reads them back as a single string', () => {
+    const w = installOpaque();
+    w.document.cookie = 'one=1';
+    w.document.cookie = 'two=2';
+    const value = w.document.cookie;
+    expect(value).toContain('one=1');
+    expect(value).toContain('two=2');
+    expect(value).toContain('; ');
+  });
+
+  it('replaces an existing cookie of the same name', () => {
+    const w = installOpaque();
+    w.document.cookie = 'a=first';
+    w.document.cookie = 'a=second';
+    expect(w.document.cookie).toBe('a=second');
+  });
+
+  it('ignores attributes such as path and domain when storing', () => {
+    const w = installOpaque();
+    w.document.cookie = 'token=abc; Path=/; Domain=example.com; Secure';
+    expect(w.document.cookie).toBe('token=abc');
+  });
+
+  it('deletes a cookie when max-age is zero or negative', () => {
+    const w = installOpaque();
+    w.document.cookie = 'gone=1';
+    expect(w.document.cookie).toBe('gone=1');
+    w.document.cookie = 'gone=1; Max-Age=0';
+    expect(w.document.cookie).toBe('');
+  });
+
+  it('leaves a real origin cookie untouched', () => {
+    const w = new Window({ url: PAGE });
+    w.eval(buildClientRuntimeScript(CFG));
+    // A same-origin frame keeps the platform implementation, which happy-dom
+    // backs with a real store.
+    w.document.cookie = 'real=1';
+    expect(w.document.cookie).toContain('real=1');
+  });
+});
+
+describe('client runtime: indexedDB shim', () => {
+  it('opens a database and resolves requests without throwing', async () => {
+    const w = installOpaque();
+    const opened = await new Promise<{ ok: boolean; store?: unknown }>((resolve) => {
+      const req = w.indexedDB.open('db1');
+      req.onsuccess = (event: { target: { result: unknown } }) => resolve({ ok: true, store: event.target.result });
+      req.onerror = () => resolve({ ok: false });
+    });
+    expect(opened.ok).toBe(true);
+  });
+
+  it('round-trips a value through an object store', async () => {
+    const w = installOpaque();
+    const db = await new Promise<{
+      createObjectStore(n: string): {
+        put(v: unknown, k?: unknown): { onsuccess: unknown };
+        get(k: unknown): { onsuccess: unknown; result: unknown };
+      };
+      transaction(n: string): { objectStore(n: string): unknown };
+    }>((resolve) => {
+      const req = w.indexedDB.open('db2');
+      req.onsuccess = (event: { target: { result: never } }) => resolve(event.target.result);
+    });
+
+    const store = db.createObjectStore('items');
+    await new Promise<void>((resolve) => {
+      const put = store.put({ id: 'a', value: 42 }, 'a');
+      put.onsuccess = () => resolve();
+    });
+
+    const fetched = await new Promise<unknown>((resolve) => {
+      const get = db.transaction('items').objectStore('items') as {
+        get(k: unknown): { onsuccess: unknown; result: unknown };
+      };
+      const req = get.get('a');
+      req.onsuccess = () => resolve(req.result);
+    });
+    expect(fetched).toEqual({ id: 'a', value: 42 });
+  });
+});
+
+describe('client runtime: caches shim', () => {
+  it('exposes a CacheStorage that resolves instead of throwing', async () => {
+    const w = installOpaque();
+    const cache = await w.caches.open('v1');
+    expect(await w.caches.has('v1')).toBe(true);
+    expect(await cache.match('/missing')).toBeUndefined();
+    expect(await w.caches.keys()).toContain('v1');
+  });
+
+  it('stores and returns a cached response', async () => {
+    const w = installOpaque();
+    const cache = await w.caches.open('v2');
+    const response = new Response('body');
+    await cache.put('/page', response);
+    expect(await cache.match('/page')).toBe(response);
+  });
+});
+
+describe('client runtime: service worker shim', () => {
+  it('provides a resolvable registration surface', async () => {
+    const w = installOpaque();
+    await expect(w.navigator.serviceWorker.getRegistrations()).resolves.toEqual([]);
+    await expect(w.navigator.serviceWorker.getRegistration()).resolves.toBeUndefined();
+    const registration = await w.navigator.serviceWorker.register('/sw.js');
+    expect(registration).toHaveProperty('scope');
+  });
+
+  it('exposes a resolved ready promise so startup does not hang', async () => {
+    const w = installOpaque();
+    await expect(w.navigator.serviceWorker.ready).resolves.toBeDefined();
+  });
+});
+
+describe('client runtime: frame error reporting', () => {
+  it('posts uncaught errors to the parent with the runtime channel', async () => {
+    const w = new Window({ url: PAGE });
+    const received: unknown[] = [];
+    Object.defineProperty(w, 'parent', {
+      configurable: true,
+      value: { postMessage: (message: unknown) => received.push(message) },
+    });
+    w.eval(buildClientRuntimeScript(CFG));
+
+    w.__mirendaRuntime.reportError('error', 'boom', 'file.js');
+    expect(received).toHaveLength(1);
+    const message = received[0] as { channel: string; kind: string; message: string };
+    expect(message.channel).toBe('mirenda-frame-error');
+    expect(message.kind).toBe('error');
+    expect(message.message).toBe('boom');
+  });
+
+  it('reports an unhandled rejection', async () => {
+    const w = new Window({ url: PAGE });
+    const received: unknown[] = [];
+    Object.defineProperty(w, 'parent', {
+      configurable: true,
+      value: { postMessage: (message: unknown) => received.push(message) },
+    });
+    w.eval(buildClientRuntimeScript(CFG));
+
+    const event = new w.Event('unhandledrejection') as Event & { reason?: unknown };
+    event.reason = new Error('async boom');
+    w.dispatchEvent(event);
+
+    expect(received.length).toBeGreaterThan(0);
+    const message = received[received.length - 1] as { kind: string; message: string };
+    expect(message.kind).toBe('unhandledrejection');
+    expect(message.message).toBe('async boom');
+  });
+});
+
+describe('client runtime: target attribute rewriting', () => {
+  it('forces _top and _parent to _self via setAttribute', () => {
+    const w = install();
+    const anchor = w.document.createElement('a');
+    anchor.setAttribute('target', '_top');
+    expect(anchor.getAttribute('target')).toBe('_self');
+
+    const form = w.document.createElement('form');
+    form.setAttribute('target', '_parent');
+    expect(form.getAttribute('target')).toBe('_self');
+  });
+
+  it('leaves other target values alone', () => {
+    const w = install();
+    const anchor = w.document.createElement('a');
+    anchor.setAttribute('target', 'someframe');
+    expect(anchor.getAttribute('target')).toBe('someframe');
+  });
+});
+
+describe('client runtime: link interception', () => {
+  it('routes a same-frame link click through the proxy', () => {
+    const w = install();
+    const assigned: string[] = [];
+    Object.defineProperty(w.location, 'assign', {
+      configurable: true,
+      value: (url: string) => assigned.push(url),
+    });
+
+    const anchor = w.document.createElement('a');
+    anchor.setAttribute('href', '/next');
+    w.document.body.append(anchor);
+
+    const click = new w.MouseEvent('click', { bubbles: true, cancelable: true, button: 0 });
+    anchor.dispatchEvent(click);
+
+    expect(assigned).toHaveLength(1);
+    expect(assigned[0]).toContain('/proxy?url=');
+    expect(decodeURIComponent(assigned[0]!)).toContain('https://www.google.com/next');
+  });
+
+  it('does not intercept a download link', () => {
+    const w = install();
+    const anchor = w.document.createElement('a');
+    anchor.setAttribute('href', '/file.zip');
+    anchor.setAttribute('download', '');
+    w.document.body.append(anchor);
+
+    // Assert on prevention rather than on `location.assign`: happy-dom also
+    // performs a native navigation for an unhandled anchor click, so watching
+    // `assign` cannot distinguish "our handler ran" from "the engine did it".
+    const click = new w.MouseEvent('click', { bubbles: true, cancelable: true, button: 0 });
+    anchor.dispatchEvent(click);
+    expect(click.defaultPrevented).toBe(false);
+  });
+
+  it('prevents the default action for a normal link', () => {
+    const w = install();
+    const anchor = w.document.createElement('a');
+    anchor.setAttribute('href', '/next');
+    w.document.body.append(anchor);
+
+    const click = new w.MouseEvent('click', { bubbles: true, cancelable: true, button: 0 });
+    anchor.dispatchEvent(click);
+    expect(click.defaultPrevented).toBe(true);
+  });
+});

@@ -9,6 +9,7 @@ import { el, icon } from './dom.js';
 import { openAuthSheet } from './auth-sheet.js';
 import { openVaultSheet } from './vault-sheet.js';
 import { openExtensionSheet, openProfileSheet, openTabSheet, type SheetDeps } from './sheets.js';
+import { openToolsSheet } from './tools-sheet.js';
 
 /** Blank-tab sentinel; mirrors the worker's `NEW_TAB_URL`. */
 export const NEW_TAB_URL = 'about:newtab';
@@ -62,20 +63,23 @@ export class BrowserApp {
   mount(root: HTMLElement): void {
     root.replaceChildren();
     const viewport = el('div', { class: 'viewport' });
-    const statusbar = el('div', { class: 'statusbar' });
-    const chrome = el('div', { class: 'chrome' });
     const loadbarSlot = el('div', { class: 'loadbar-slot' });
+    this.viewportEl = viewport;
 
-    this.statusDomain = el('span', { class: 'statusbar__domain', text: 'No page' });
-    this.statusProfile = el('span', { class: 'statusbar__profile' });
-    statusbar.append(this.statusDomain, this.statusProfile);
+    /* ---------------------------------------------------------- the pill */
+    this.backButton = this.pillButton('back', 'Back', () => this.goBack());
+    this.forwardButton = this.pillButton('forward', 'Forward', () => this.goForward());
 
-    // ---- address bar ------------------------------------------------------
-    this.backButton = this.iconButton('back', 'Back', () => this.goBack());
-    this.forwardButton = this.iconButton('forward', 'Forward', () => this.goForward());
+    // The URL field doubles as the address bar: tapping it swaps in a real
+    // input in place, so the pill never jumps and no separate bar is needed.
+    this.urlDisplay = el('button', { class: 'pill__url pill__url--empty', type: 'button', 'aria-label': 'Address' });
+    this.urlLock = icon('lock');
+    this.urlText = el('span', { class: 'pill__url__text', text: 'Search or enter address' });
+    this.urlDisplay.append(this.urlLock, this.urlText);
+    this.urlDisplay.addEventListener('click', () => this.beginEditing());
 
     this.addressInput = el('input', {
-      class: 'addressbar__input',
+      class: 'pill__input',
       type: 'text',
       inputmode: 'url',
       enterkeyhint: 'go',
@@ -85,49 +89,54 @@ export class BrowserApp {
       placeholder: 'Search or enter address',
       'aria-label': 'Address bar',
     });
-
-    const reloadButton = this.iconButton('reload', 'Reload', () => this.reload());
-    const goButton = this.iconButton('go', 'Go', () => this.navigateFromInput(), 'iconbtn--primary');
-    goButton.type = 'submit';
-
+    this.addressInput.hidden = true;
     this.addressInput.addEventListener('keydown', (event) => {
       if (event.key === 'Enter') {
         event.preventDefault();
         this.navigateFromInput();
+      } else if (event.key === 'Escape') {
+        this.endEditing();
       }
     });
+    this.addressInput.addEventListener('blur', () => this.endEditing());
     this.addressInput.addEventListener('focus', () => this.addressInput.select());
 
-    const form = el('form', { class: 'addressbar' }, this.backButton, this.forwardButton, this.addressInput, reloadButton, goButton);
-    form.addEventListener('submit', (event) => {
-      event.preventDefault();
-      this.navigateFromInput();
+    this.tabCount = el('span', { class: 'pill__count', text: '1' });
+    this.tabsButton = el('button', { class: 'pill__btn', type: 'button', 'aria-label': 'Tabs' }, this.tabCount);
+    this.tabsButton.addEventListener('click', () => this.openTabs());
+
+    const toolsButton = this.pillButton('bolt', 'Tools', () => this.openTools());
+    toolsButton.classList.add('pill__btn--accent');
+
+    this.zenButton = this.pillButton('zen', 'Zen mode', () => this.toggleZen());
+    // Zen lives at the far right, out of the way of the thumb's main path.
+    this.zenButton.classList.add('pill__btn--zen');
+
+    this.pill = el(
+      'div',
+      { class: 'pill', role: 'toolbar', 'aria-label': 'Browser controls' },
+      this.backButton,
+      this.urlDisplay,
+      this.addressInput,
+      this.tabsButton,
+      toolsButton,
+      this.zenButton,
+    );
+
+    /* --------------------------------------------------- zen-mode bubble */
+    this.zenBubble = el('button', { class: 'zenbubble', type: 'button', 'aria-label': 'Exit zen mode' });
+    this.zenBubble.append(icon('zen'));
+    this.zenBubble.hidden = true;
+    this.makeDraggable(this.zenBubble);
+
+    /* ------------------------------------------------------ diagnostics */
+    this.diag = el('div', { class: 'diag', role: 'status' });
+    this.diag.hidden = true;
+    this.diag.addEventListener('click', () => {
+      this.diag.hidden = true;
     });
 
-    // ---- toolbar ----------------------------------------------------------
-    this.tabCount = el('span', { class: 'tabcount', text: '1' });
-    const tabsButton = el('button', { class: 'iconbtn', type: 'button', 'aria-label': 'Tabs' }, this.tabCount);
-    tabsButton.addEventListener('click', () => this.openTabs());
-
-    const profilesButton = this.iconButton('profiles', 'Profiles', () => this.openProfiles());
-    const extensionsButton = this.iconButton('extensions', 'Extensions', () => this.openExtensions());
-    this.vaultButton = this.iconButton('lock', 'Vault', () => this.openVault());
-
-    const uaButton = this.iconButton('ua', 'User-Agent', () => this.openUserAgent('tab'));
-    // Long-press is not reliable on mobile, so the sheet itself offers the
-    // profile-wide scope alongside the per-tab one.
-    const left = el('div', { class: 'toolbar__group' }, tabsButton, profilesButton, uaButton);
-    const right = el('div', { class: 'toolbar__group' }, this.vaultButton, extensionsButton);
-    const toolbar = el('div', { class: 'toolbar' }, left, right);
-
-    chrome.append(form, toolbar);
-
-    this.fab = el('button', { class: 'fab', type: 'button', 'aria-label': 'Toggle extensions on this page' });
-    this.fab.append(icon('extensions'));
-    this.fab.addEventListener('click', () => this.openExtensions());
-
-    root.append(viewport, loadbarSlot, statusbar, chrome, this.fab);
-    this.viewportEl = viewport;
+    root.append(viewport, loadbarSlot, this.pill, this.zenBubble, this.diag);
 
     // Install the RPC bridge once. It answers nothing until `setViewport` is
     // called with the iframe this shell created, so any other frame is ignored.
@@ -136,6 +145,7 @@ export class BrowserApp {
         getProfileId: () => this.store.get().activeProfileId ?? '',
       }),
       onReject: (reason) => console.warn('sandbox bridge rejected message:', reason),
+      onFrameError: (report) => this.showDiagnostic(report),
     });
 
     this.store.subscribe((state) => this.render(state));
@@ -143,52 +153,145 @@ export class BrowserApp {
   }
 
   private viewportEl!: HTMLDivElement;
-  private statusTimer: ReturnType<typeof setTimeout> | null = null;
+  private pill!: HTMLDivElement;
+  private zenBubble!: HTMLButtonElement;
+  private zenButton!: HTMLButtonElement;
+  private tabsButton!: HTMLButtonElement;
+  private urlDisplay!: HTMLButtonElement;
+  private urlText!: HTMLSpanElement;
+  private urlLock!: SVGSVGElement;
+  private diag!: HTMLDivElement;
+  private editing = false;
+  private zen = false;
+  private diagTimer: ReturnType<typeof setTimeout> | null = null;
+  private loadbarTimer: ReturnType<typeof setTimeout> | null = null;
 
   /**
-   * Show a transient message in the status bar. Used for failures that would
-   * otherwise be silent, so the UI never claims a state the worker rejected.
+   * Surface a diagnostic from the proxied frame.
+   *
+   * The frame cannot write to the shell's console, so a page that dies on a
+   * script error would otherwise fail silently. This shows one compact line and
+   * auto-dismisses; tapping it dismisses immediately.
    */
-  private showStatus(message: string, isError = false): void {
-    if (this.statusTimer) clearTimeout(this.statusTimer);
-    this.statusDomain.textContent = message;
-    this.statusDomain.classList.toggle('statusbar__domain--error', isError);
-    this.statusTimer = setTimeout(() => {
-      this.statusTimer = null;
-      this.statusDomain.classList.remove('statusbar__domain--error');
-      this.statusDomain.textContent = this.store.get().addressValue
-        ? originOf(this.store.get().addressValue)
-        : 'No page';
-    }, 4000);
+  private showDiagnostic(report: { kind: string; message: string; detail: string | null }): void {
+    if (this.diagTimer) clearTimeout(this.diagTimer);
+    const label = report.kind === 'unhandledrejection' ? 'Page error (async)' : 'Page error';
+    this.diag.replaceChildren(
+      el('span', { class: 'diag__dot' }),
+      el('span', { class: 'diag__text', text: `${label}: ${report.message}` }),
+    );
+    this.diag.hidden = false;
+    this.diagTimer = setTimeout(() => {
+      this.diagTimer = null;
+      this.diag.hidden = true;
+    }, 8000);
+  }
+
+  /* ------------------------------------------------------------- pill UX */
+
+  /** Swap the URL label for a real input, keeping the pill's geometry. */
+  private beginEditing(): void {
+    if (this.editing) return;
+    this.editing = true;
+    const state = this.store.get();
+    const tab = state.tabs.find((t) => t.id === state.activeTabId);
+    this.addressInput.value = tab && tab.url !== NEW_TAB_URL ? displayUrl(tab.url) : '';
+    this.urlDisplay.hidden = true;
+    this.addressInput.hidden = false;
+    this.addressInput.focus();
+  }
+
+  private endEditing(): void {
+    if (!this.editing) return;
+    this.editing = false;
+    this.addressInput.hidden = true;
+    this.urlDisplay.hidden = false;
+    this.renderUrlLabel(this.store.get());
+  }
+
+  /** Show the current page's host, or a hint when there is no page. */
+  private renderUrlLabel(state: ReturnType<Store['get']>): void {
+    const tab = state.tabs.find((t) => t.id === state.activeTabId);
+    const hasPage = !!tab && tab.url !== NEW_TAB_URL;
+    this.urlDisplay.classList.toggle('pill__url--empty', !hasPage);
+    this.urlText.textContent = hasPage ? displayUrl(tab.url) : 'Search or enter address';
+    // A padlock on a proxied page would imply a TLS guarantee Mirenda cannot
+    // make about the target; the glyph signals "contained", not "verified".
+    this.urlLock.style.opacity = hasPage ? '1' : '0.45';
+  }
+
+  /* ------------------------------------------------------------ zen mode */
+
+  private toggleZen(): void {
+    this.zen = !this.zen;
+    this.pill.classList.toggle('pill--hidden', this.zen);
+    this.zenBubble.hidden = !this.zen;
+    if (this.zen) {
+      this.zenBubble.style.left = '';
+      this.zenBubble.style.top = '';
+      this.zenBubble.style.right = '14px';
+      this.zenBubble.style.bottom = 'calc(18px + var(--safe-bottom))';
+    }
+  }
+
+  /**
+   * Let the zen bubble be dragged anywhere in the viewport.
+   *
+   * Pointer events (not mouse events) so a touch drag works without the page
+   * scrolling underneath. A tap without movement exits zen mode.
+   */
+  private makeDraggable(handle: HTMLElement): void {
+    let dragging = false;
+    let moved = false;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    handle.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0) return;
+      const rect = handle.getBoundingClientRect();
+      offsetX = event.clientX - rect.left;
+      offsetY = event.clientY - rect.top;
+      dragging = true;
+      moved = false;
+      handle.setPointerCapture(event.pointerId);
+    });
+
+    handle.addEventListener('pointermove', (event) => {
+      if (!dragging) return;
+      if (Math.abs(event.movementX) + Math.abs(event.movementY) > 0) moved = true;
+      const x = Math.min(Math.max(0, event.clientX - offsetX), window.innerWidth - handle.offsetWidth);
+      const y = Math.min(Math.max(0, event.clientY - offsetY), window.innerHeight - handle.offsetHeight);
+      handle.style.left = `${x}px`;
+      handle.style.top = `${y}px`;
+      handle.style.right = 'auto';
+      handle.style.bottom = 'auto';
+    });
+
+    const end = (event: PointerEvent): void => {
+      if (!dragging) return;
+      dragging = false;
+      try {
+        handle.releasePointerCapture(event.pointerId);
+      } catch {
+        /* already released */
+      }
+      // A tap (no movement) is the exit gesture; a drag just repositions.
+      if (!moved) this.toggleZen();
+    };
+    handle.addEventListener('pointerup', end);
+    handle.addEventListener('pointercancel', end);
   }
 
   /* ------------------------------------------------------------ rendering */
 
   private render(state: ReturnType<Store['get']>): void {
     this.tabCount.textContent = String(state.tabs.length);
-    this.statusDomain.textContent = state.addressValue ? originOf(state.addressValue) : 'No page';
+    this.tabCount.classList.toggle('pill__count--busy', state.loading);
+    if (!this.editing) this.renderUrlLabel(state);
 
     const profile = state.profiles.find((p) => p.id === state.activeProfileId) ?? null;
-    this.statusProfile.replaceChildren(
-      el('span', { class: 'dot', style: `background:${profile?.color ?? '#4f8cff'}` }),
-      document.createTextNode(profile?.name ?? 'No profile'),
-    );
-
-    this.vaultButton.className = `iconbtn${this.vaultKey ? ' iconbtn--active' : ''}`;
-    this.vaultButton.setAttribute('aria-label', this.vaultKey ? 'Vault (unlocked)' : 'Vault (locked)');
-    this.vaultButton.replaceChildren(icon(this.vaultKey ? 'unlock' : 'lock'));
-
-    const enabledCount = state.enabledExtensions.size;
-    this.fab.className = `fab${enabledCount > 0 ? ' fab--on' : ''}`;
-    this.fab.setAttribute(
-      'aria-label',
-      enabledCount > 0 ? `${enabledCount} extension(s) active on this page` : 'Extensions',
-    );
-
-    if (document.activeElement !== this.addressInput) {
-      const tab = state.tabs.find((t) => t.id === state.activeTabId);
-      this.addressInput.value = tab && tab.url !== NEW_TAB_URL ? displayUrl(tab.url) : '';
-    }
+    // Tint the pill's hairline with the active profile's colour.
+    document.documentElement.style.setProperty('--profile-tint', profile?.color ?? '#ff7a18');
 
     this.backButton.disabled = this.historyIndex <= 0;
     this.forwardButton.disabled = this.historyIndex >= this.history.length - 1;
@@ -208,17 +311,11 @@ export class BrowserApp {
     if (!url || url === NEW_TAB_URL) {
       this.iframe = null;
       this.bridge?.setViewport(null);
-      this.viewportEl.append(
-        el(
-          'div',
-          { class: 'viewport__empty' },
-          el('h1', { text: 'Mirenda' }),
-          el('p', { text: 'Type an address below. Pages render inside an isolated, sandboxed viewport.' }),
-        ),
-      );
+      this.viewportEl.append(this.buildHomeScreen());
       return;
     }
 
+    this.setLoading(true);
     const state = this.store.get();
     const profileId = state.activeProfileId ?? '';
     const tabId = state.activeTabId;
@@ -240,17 +337,112 @@ export class BrowserApp {
       src: proxyUrl(url, profileId, { token, sandboxOrigin: this.sandboxOrigin, tabId }),
       // No `allow-same-origin`: the proxied document must never share an origin
       // with Mirenda's own UI, even when it is same-origin at the HTTP level.
-      // This is what makes `event.origin` opaque inside the frame.
+      // This is what makes `event.origin` opaque inside the frame, and it is
+      // also why the runtime shim has to virtualise cookies and storage.
       sandbox: 'allow-scripts allow-forms allow-popups allow-modals allow-downloads',
       referrerpolicy: 'no-referrer',
       allow: 'fullscreen',
       title: 'Proxied page',
     });
+    frame.addEventListener('load', () => this.setLoading(false));
     this.iframe = frame;
     this.viewportEl.append(frame);
     // Tell the bridge which frame is trustworthy. Until this call the bridge
     // answers nothing, so a frame created elsewhere can never reach the API.
     this.bridge?.setViewport(frame);
+    // A frame that never fires `load` (blocked upstream) must not leave the
+    // pill pulsing forever.
+    this.loadbarTimer = setTimeout(() => this.setLoading(false), 20_000);
+  }
+
+  /** Toggle the pill's busy affordance and the top load bar. */
+  private setLoading(loading: boolean): void {
+    this.store.set({ loading });
+    const slot = document.querySelector('.loadbar-slot');
+    if (!slot) return;
+    if (loading) {
+      if (!slot.firstChild) slot.append(el('div', { class: 'loadbar' }));
+    } else {
+      slot.replaceChildren();
+      if (this.loadbarTimer) {
+        clearTimeout(this.loadbarTimer);
+        this.loadbarTimer = null;
+      }
+    }
+  }
+
+  /** The new-tab screen: branding, a search field, and quick-launch chips. */
+  private buildHomeScreen(): HTMLElement {
+    const mark = el('div', { class: 'home__mark' });
+    mark.append(icon('shield'));
+
+    const input = el('input', {
+      type: 'text',
+      inputmode: 'search',
+      enterkeyhint: 'go',
+      autocapitalize: 'off',
+      autocorrect: 'off',
+      spellcheck: 'false',
+      placeholder: 'Search or enter address',
+      'aria-label': 'Search or enter address',
+    });
+
+    const submit = (): void => {
+      const target = normalizeAddressInput(input.value);
+      if (!target) return;
+      input.value = '';
+      void this.navigate(target);
+    };
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        submit();
+      }
+    });
+
+    const searchRow = el('div', { class: 'home__search' }, icon('search'), input);
+    searchRow.addEventListener('click', () => input.focus());
+
+    const chips = el('div', { class: 'home__chips' });
+    const quick = this.store.get().bookmarks.slice(0, 6);
+    if (quick.length > 0) {
+      for (const bookmark of quick) {
+        const chip = el(
+          'button',
+          { class: 'home__chip', type: 'button' },
+          el('span', { class: 'home__chip__dot' }),
+          document.createTextNode(bookmark.title || originOf(bookmark.url)),
+        );
+        chip.addEventListener('click', () => void this.navigate(bookmark.url));
+        chips.append(chip);
+      }
+    } else {
+      // No bookmarks yet: offer the sites that exercise the proxy hardest.
+      for (const site of [
+        { label: 'Wikipedia', url: 'https://en.wikipedia.org/' },
+        { label: 'DuckDuckGo', url: 'https://duckduckgo.com/' },
+        { label: 'Google', url: 'https://www.google.com/' },
+      ]) {
+        const chip = el(
+          'button',
+          { class: 'home__chip', type: 'button' },
+          el('span', { class: 'home__chip__dot' }),
+          document.createTextNode(site.label),
+        );
+        chip.addEventListener('click', () => void this.navigate(site.url));
+        chips.append(chip);
+      }
+    }
+
+    return el(
+      'div',
+      { class: 'home' },
+      mark,
+      el('h1', { class: 'home__title', text: 'Mirenda' }),
+      el('p', { class: 'home__subtitle', text: 'Private browsing, in your browser' }),
+      searchRow,
+      chips,
+    );
   }
 
   /* -------------------------------------------------------------- actions */
@@ -259,14 +451,50 @@ export class BrowserApp {
     const state = this.store.get();
     if (!state.user) return;
     if (state.profiles.length === 0) {
+      // Re-check with the server before creating anything: an empty local list
+      // can simply mean the profile load has not finished yet.
+      const existing = await api.listProfiles();
+      const first = existing[0];
+      if (first) {
+        const activeProfileId = first.id;
+        this.store.set({ profiles: existing, activeProfileId });
+        await this.loadProfileScoped(activeProfileId);
+        await this.loadTabs(activeProfileId);
+        return;
+      }
       const profile = await api.createProfile({ name: 'Personal', color: '#4f8cff' });
       this.store.set({ profiles: [profile], activeProfileId: profile.id });
+      await this.loadProfileScoped(profile.id);
       await this.ensureTab(profile.id);
       return;
     }
     const activeProfileId = state.activeProfileId ?? state.profiles[0]?.id ?? null;
     this.store.set({ activeProfileId });
-    if (activeProfileId) await this.loadTabs(activeProfileId);
+    if (activeProfileId) {
+      await this.loadProfileScoped(activeProfileId);
+      await this.loadTabs(activeProfileId);
+    }
+  }
+
+  /**
+   * Load the per-profile data the shell renders outside the viewport:
+   * bookmarks for the home screen and the extension registry for the Tools
+   * sheet. A failure here must not break browsing, so it is contained.
+   */
+  private async loadProfileScoped(profileId: string): Promise<void> {
+    try {
+      const [extensions, bookmarks] = await Promise.all([
+        api.listExtensions(profileId),
+        api.listBookmarks(profileId),
+      ]);
+      this.store.set({
+        extensions,
+        bookmarks,
+        enabledExtensions: new Set(extensions.filter((e) => e.enabled).map((e) => e.id)),
+      });
+    } catch {
+      this.store.set({ extensions: [], bookmarks: [] });
+    }
   }
 
   private async ensureTab(profileId: string): Promise<void> {
@@ -377,6 +605,58 @@ export class BrowserApp {
 
   private openExtensions(): void {
     openExtensionSheet(this.sheetDeps());
+  }
+
+  /** The `⚡ Tools` sheet: extensions, UA, reload, profiles, and the vault. */
+  private openTools(): void {
+    const state = this.store.get();
+    openToolsSheet({
+      extensions: state.extensions,
+      enabled: state.enabledExtensions,
+      vaultUnlocked: this.vaultKey !== null,
+      onToggleExtension: (id, enabled) => this.sheetDeps().toggleExtension(id, enabled),
+      onOpenUserAgent: () => this.openUserAgent('tab'),
+      onReload: () => this.reload(),
+      onHardReload: () => this.hardReload(),
+      onOpenProfiles: () => this.openProfiles(),
+      onOpenVault: () => this.openVault(),
+      onOpenExtensions: () => this.openExtensions(),
+    });
+  }
+
+  /** Reload bypassing every cache the worker and browser might hold. */
+  private hardReload(): void {
+    const state = this.store.get();
+    const tab = state.tabs.find((t) => t.id === state.activeTabId);
+    if (!tab || tab.url === NEW_TAB_URL) return;
+    void this.renderViewport(`${tab.url}${tab.url.includes('?') ? '&' : '?'}mirenda_cachebust=${Date.now()}`);
+  }
+
+  /** A pill button that matches the shell's visual language. */
+  private pillButton(
+    name: Parameters<typeof icon>[0],
+    label: string,
+    onClick: () => void,
+  ): HTMLButtonElement {
+    const button = el('button', { class: 'pill__btn', type: 'button', 'aria-label': label, title: label });
+    button.append(icon(name));
+    button.addEventListener('click', onClick);
+    return button;
+  }
+
+  /** Surface a transient status message; kept for legacy call sites. */
+  private showStatus(message: string, isError = false): void {
+    if (this.diagTimer) clearTimeout(this.diagTimer);
+    this.diag.replaceChildren(
+      el('span', { class: 'diag__dot' }),
+      el('span', { class: 'diag__text', text: message }),
+    );
+    this.diag.style.borderColor = isError ? 'rgba(255, 92, 108, 0.42)' : 'rgba(255, 255, 255, 0.16)';
+    this.diag.hidden = false;
+    this.diagTimer = setTimeout(() => {
+      this.diagTimer = null;
+      this.diag.hidden = true;
+    }, isError ? 6000 : 3000);
   }
 
   private openVault(): void {
@@ -502,9 +782,9 @@ export async function bootAuthenticated(
   store: Store,
   vaultKey: CryptoKey | null,
 ): Promise<void> {
-  const app = new BrowserApp({ store, vaultKey });
-  app.mount(root);
-
+  // Load profiles before mounting: mount() kicks off bootstrap(), which creates
+  // a default profile whenever it sees an empty list. Mounting first made every
+  // reload spawn another profile.
   const profiles = await api.listProfiles();
   const activeProfileId = store.get().activeProfileId ?? profiles[0]?.id ?? null;
   const extensions = activeProfileId ? await api.listExtensions(activeProfileId) : [];
@@ -514,6 +794,9 @@ export async function bootAuthenticated(
     enabledExtensions: new Set(extensions.filter((extension) => extension.enabled).map((e) => e.id)),
     activeProfileId,
   });
+
+  const app = new BrowserApp({ store, vaultKey });
+  app.mount(root);
 }
 
 /** Show the auth sheet when there is no session. */

@@ -58,6 +58,87 @@ The worker serves the built UI from its assets binding. `npm run build` writes
 same worker that injects the script also serves it. `wrangler dev` serves a stale
 or missing UI until you build once.
 
+## Two-role local dev
+
+Local dev runs the whole stack in one Worker (`WORKER_ROLE=all`), which is the
+fastest loop. To exercise the **split** deployment — the one where a hostile
+proxied page genuinely cannot reach the session — run two Workers on separate
+origins:
+
+```bash
+npm run dev:app       # :8787 — /api/*, auth, vault, UI
+npm run dev:sandbox   # :8788 — /proxy + extension bundles only
+```
+
+Three things bite here, and all three are silent in the browser:
+
+**1. The sandbox must serve the extension bundles.** In the split deployment the
+viewport iframe's origin *is* the sandbox, so the sandbox is the only Worker that
+can serve the injected `<script src="/extensions/…">`. `wrangler dev` snapshots
+its asset directory **at boot**, so a sandbox started before
+`apps/worker/sandbox-assets/` exists answers `{"error":"not found"}` for every
+bundle and extensions silently never boot. `npm run dev:sandbox` therefore runs
+`build:sandbox-assets` first. If you start the sandbox by hand, rebuild the
+assets *and restart* it:
+
+```bash
+npm run build:extensions && npm run build:sandbox-assets
+# then restart `wrangler dev --env sandbox`
+```
+
+**2. The sandbox needs `PROXY_TOKEN_SECRET` at boot.** It is a **secret**, not a
+`[vars]` entry, so `[env.sandbox.vars]` does not provide it and a bare
+`wrangler dev --env sandbox` returns `503 {"error":"proxy tokens are not
+configured"}` with an empty viewport. `npm run dev:sandbox` passes the dev value
+for you. By hand:
+
+```bash
+npx wrangler dev --env sandbox --port 8788 --local \
+  --var PROXY_TOKEN_SECRET:dev-only-proxy-token-secret-change-me-32chars
+```
+
+The app and sandbox roles must use the **same** value — the app signs a proxy
+token, the sandbox verifies it.
+
+**3. Each Worker must know its own public origin.** `APP_ORIGIN`,
+`SANDBOX_ORIGIN` and `ALLOWED_ORIGINS` drive CORS and the proxy-token audience.
+Over a tunnel, `localhost` is the wrong answer, so pass the tunnel URLs at boot
+(see below).
+
+### Testing on a phone with Quick Tunnels
+
+`npm run dev:tunnel` builds, opens a Quick Tunnel per role, then starts both
+Workers with the resulting `*.trycloudflare.com` origins wired in:
+
+```bash
+npm run dev:tunnel
+#   app      https://<random>.trycloudflare.com
+#   sandbox  https://<random>.trycloudflare.com
+```
+
+Open the **app** URL on the phone. Each tunnel URL is random per run, and the
+Workers are started *after* the tunnels so the origins match. Logs land in
+`/tmp/mirenda/`. Set `CLOUDFLARED=/path/to/cloudflared` if the binary is not on
+`PATH`.
+
+Because `trycloudflare.com` is on the Public Suffix List, the two URLs are
+separate registrable domains — the same isolation you get in production.
+
+### Troubleshooting extensions
+
+If an extension is enabled and its `<script>` tag appears in the proxied HTML but
+nothing happens in the page:
+
+- `curl -sI https://<sandbox>/extensions/eruda-devtools.js` — must be `200` with
+  `content-type: application/javascript`. A 21-byte JSON body means the sandbox
+  started without its assets (cause 1 above).
+- Errors inside the sandboxed iframe are masked to `"Script error."` by design,
+  because its origin is opaque. Debug by fetching the bundle and evaluating it
+  in a `try`/`catch` *inside the frame*, which surfaces the real message.
+- `window.eruda` is **not** the library: eruda mounts `<div id="eruda">`, and
+  HTML named-element lookup makes `window.eruda` resolve to that element. Assert
+  on `document.getElementById('eruda').shadowRoot` instead.
+
 ## Scripts
 
 | Command | What it does |
@@ -65,6 +146,9 @@ or missing UI until you build once.
 | `npm run dev` | Worker (`:8787`) + Vite (`:5173`) together. |
 | `npm run dev:worker` | Worker only. |
 | `npm run dev:web` | Vite only. |
+| `npm run dev:app` | Split role: app Worker (`:8787`), `/api/*` + UI. |
+| `npm run dev:sandbox` | Split role: rebuilds sandbox assets, then the sandbox Worker (`:8788`). |
+| `npm run dev:tunnel` | Both split roles behind Quick Tunnels, with origins wired in. |
 | `npm run build` | Web UI, then all extension bundles, then the sandbox asset copy. |
 | `npm run build:web` | Build the mobile UI only. |
 | `npm run build:extensions` | Rebuild the Eruda, cookie-manager and js/css-studio bundles. |

@@ -4,7 +4,7 @@
  * Tabs and profiles mirror the worker; the vault key lives only here, in
  * memory, and is never persisted to localStorage or sent to the server.
  */
-import type { ExtensionRecord, Profile, Tab, User } from './api.js';
+import type { Bookmark, ExtensionRecord, Profile, Tab, User } from './api.js';
 
 export interface BrowserState {
   user: User | null;
@@ -15,6 +15,8 @@ export interface BrowserState {
   extensions: ExtensionRecord[];
   /** Extension ids the user has switched on. */
   enabledExtensions: Set<string>;
+  /** Quick-launch bookmarks for the active profile, shown on the home screen. */
+  bookmarks: Bookmark[];
   /** True when the vault key is unlocked for the active profile. */
   vaultUnlocked: boolean;
   addressValue: string;
@@ -37,6 +39,7 @@ export class Store {
       activeTabId: null,
       extensions: [],
       enabledExtensions: new Set(),
+      bookmarks: [],
       vaultUnlocked: false,
       addressValue: '',
       loading: false,
