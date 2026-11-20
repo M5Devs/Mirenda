@@ -801,14 +801,6 @@ export async function bootAuthenticated(
 
 /** Show the auth sheet when there is no session. */
 export function bootUnauthenticated(root: HTMLElement, store: Store): void {
-  root.replaceChildren(
-    el(
-      'div',
-      { class: 'viewport__empty' },
-      el('h1', { text: 'Mirenda' }),
-      el('p', { text: 'A mobile-first cloud browser. Sign in to open your profiles and tabs.' }),
-    ),
-  );
   const button = el('button', { class: 'button button--primary', type: 'button', text: 'Sign in or create account' });
   button.addEventListener('click', () => {
     openAuthSheet({
@@ -822,6 +814,18 @@ export function bootUnauthenticated(root: HTMLElement, store: Store): void {
       },
     });
   });
-  root.append(el('div', { class: 'chrome' }, button));
+
+  // The button lives inside the empty state so its flex column positions it.
+  // A sibling wrapper would sit under the opaque overlay, which is
+  // `position:absolute; inset:0` — the button renders but is unreachable.
+  root.replaceChildren(
+    el(
+      'div',
+      { class: 'viewport__empty' },
+      el('h1', { text: 'Mirenda' }),
+      el('p', { text: 'A mobile-first cloud browser. Sign in to open your profiles and tabs.' }),
+      button,
+    ),
+  );
 }
 
