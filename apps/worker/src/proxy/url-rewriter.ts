@@ -37,8 +37,57 @@ const URL_ATTRIBUTES = new Set(['href', 'src', 'action', 'formaction', 'poster',
 const SRCSET_ATTRIBUTES = new Set(['srcset', 'imagesrcset']);
 
 /**
+ * Named entities that legitimately appear in URLs. `&amp;` is by far the most
+ * common — an HTML author must write `?a=1&amp;b=2` in a raw attribute — and it
+ * is the one that silently corrupts a proxied query string if left encoded.
+ */
+const URL_ENTITIES: Record<string, string> = {
+  amp: '&',
+  lt: '<',
+  gt: '>',
+  quot: '"',
+  apos: "'",
+  '#39': "'",
+  '#x27': "'",
+  '#x2F': '/',
+  '#47': '/',
+  nbsp: '\u00a0',
+};
+
+/**
+ * Decode HTML character references in an attribute value.
+ *
+ * `HTMLRewriter` exposes attribute values exactly as they appear in the source,
+ * so a URL written as `/w/load.php?lang=en&amp;modules=x` arrives still
+ * escaped. Encoding that verbatim produces `%26amp%3B` and the upstream server
+ * sees one nonsense parameter instead of `lang` + `modules` — which is how a
+ * stylesheet ends up served empty. Decode before resolving.
+ */
+export function decodeHtmlEntities(value: string): string {
+  return value.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (match, name: string) => {
+    const key = name.toLowerCase();
+    const direct = URL_ENTITIES[key];
+    if (direct !== undefined) return direct;
+    if (key.startsWith('#')) {
+      const code = key.startsWith('#x')
+        ? Number.parseInt(key.slice(2), 16)
+        : Number.parseInt(key.slice(1), 10);
+      // Only decode printable ASCII; anything else is left alone so a stray
+      // numeric reference cannot smuggle control characters into a URL.
+      if (Number.isFinite(code) && code >= 0x20 && code < 0x7f) {
+        return String.fromCharCode(code);
+      }
+    }
+    return match;
+  });
+}
+
+/**
  * Resolve `raw` against `base` and return an absolute http(s) URL, or `null`
  * when the reference should be left untouched.
+ *
+ * `raw` is expected to be already decoded when it came from an HTML attribute;
+ * see `resolveAttributeUrl`.
  */
 export function resolveTargetUrl(raw: string, base: string): string | null {
   const value = raw.trim();
@@ -56,6 +105,16 @@ export function resolveTargetUrl(raw: string, base: string): string | null {
   return resolved.toString();
 }
 
+/**
+ * Resolve a URL taken from an HTML attribute. Attribute text arrives
+ * entity-escaped from `HTMLRewriter`, so it is decoded first; CSS text does
+ * *not* go through here, because entities are not interpreted inside a
+ * stylesheet and decoding them there would corrupt a literal `&amp;`.
+ */
+export function resolveAttributeUrl(raw: string, base: string): string | null {
+  return resolveTargetUrl(decodeHtmlEntities(raw), base);
+}
+
 /** Wrap an absolute target URL in a `/proxy` request for `profileId`. */
 export function proxify(target: string, ctx: RewriteContext): string {
   const path = ctx.proxyPath ?? PROXY_PATH;
@@ -69,7 +128,7 @@ export function proxify(target: string, ctx: RewriteContext): string {
  * not a rewritable URL (so callers can write it back unconditionally).
  */
 export function rewriteUrlAttribute(value: string, ctx: RewriteContext): string {
-  const target = resolveTargetUrl(value, ctx.pageUrl);
+  const target = resolveAttributeUrl(value, ctx.pageUrl);
   if (!target) return value;
   return proxify(target, ctx);
 }
@@ -129,7 +188,7 @@ function splitSrcset(value: string): Array<{ url: string; descriptors: string }>
 export function rewriteSrcset(value: string, ctx: RewriteContext): string {
   return splitSrcset(value)
     .map(({ url, descriptors }) => {
-      const target = resolveTargetUrl(url, ctx.pageUrl);
+      const target = resolveAttributeUrl(url, ctx.pageUrl);
       const rewritten = target ? proxify(target, ctx) : url;
       return descriptors === '' ? rewritten : `${rewritten} ${descriptors}`;
     })
@@ -139,6 +198,10 @@ export function rewriteSrcset(value: string, ctx: RewriteContext): string {
 /**
  * Rewrite `url(...)` references inside a CSS declaration block or stylesheet.
  * Quoted and unquoted forms are both handled.
+ *
+ * `url()` is also how `@font-face`, `background-image` and `cursor` reach
+ * their files, so this covers every subresource a stylesheet pulls in except
+ * `@import`, which `rewriteCssImports` handles.
  */
 export function rewriteCssUrls(css: string, ctx: RewriteContext): string {
   return css.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (match, quote: string, rawUrl: string) => {
@@ -146,6 +209,79 @@ export function rewriteCssUrls(css: string, ctx: RewriteContext): string {
     if (!target) return match;
     return `url(${quote}${proxify(target, ctx)}${quote})`;
   });
+}
+
+/**
+ * Rewrite `@import "..."` / `@import url(...)` statements.
+ *
+ * `@import` takes a bare string, which the `url()` pass does not see. Media
+ * queries after the URL are preserved. `url(...)` imports are left to
+ * `rewriteCssUrls` so they are not rewritten twice.
+ */
+export function rewriteCssImports(css: string, ctx: RewriteContext): string {
+  return css.replace(
+    /@import\s+(['"])([^'"]+)\1/gi,
+    (match, quote: string, rawUrl: string) => {
+      const target = resolveTargetUrl(rawUrl, ctx.pageUrl);
+      if (!target) return match;
+      return `@import ${quote}${proxify(target, ctx)}${quote}`;
+    },
+  );
+}
+
+/**
+ * Full stylesheet rewrite: `@import` first (it matches a superset of the
+ * `url()` pattern only for the string form, so order is safe either way), then
+ * `url(...)`.
+ */
+export function rewriteStylesheet(css: string, ctx: RewriteContext): string {
+  return rewriteCssUrls(rewriteCssImports(css, ctx), ctx);
+}
+
+/**
+ * Extract the upstream target from a value that is already a proxy URL.
+ *
+ * The client-side runtime and the GET-form handler both need this: a form's
+ * `action` has usually already been rewritten to `/proxy?url=...` by the HTML
+ * pass, and appending `?q=...` to *that* would clobber the proxy's own query
+ * string — the classic "search box wipes the proxy params" bug.
+ */
+export function extractProxyTarget(value: string, proxyPath: string = PROXY_PATH): string | null {
+  const prefix = `${proxyPath}?`;
+  if (!value.startsWith(prefix)) return null;
+  try {
+    const params = new URLSearchParams(value.slice(prefix.length));
+    return params.get('url');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build the absolute upstream URL a `GET` form submission should navigate to.
+ *
+ * `action` may be a raw attribute (`/search`), an absolute URL, or an
+ * already-proxied URL. In every case the fields become the target's query
+ * string, merged with any query the action already carries.
+ */
+export function buildGetFormUrl(
+  action: string,
+  currentUrl: string,
+  entries: ReadonlyArray<readonly [string, string]>,
+  proxyPath: string = PROXY_PATH,
+): string | null {
+  const proxied = extractProxyTarget(action, proxyPath);
+  const base = proxied ?? resolveTargetUrl(action === '' ? currentUrl : action, currentUrl);
+  if (!base) return null;
+
+  let target: URL;
+  try {
+    target = new URL(base);
+  } catch {
+    return null;
+  }
+  for (const [name, value] of entries) target.searchParams.append(name, value);
+  return target.toString();
 }
 
 /** True when `name` carries a URL that `rewriteAttribute` handles. */

@@ -4,7 +4,7 @@
  * another user's data by guessing an id.
  */
 import type { SessionUser } from '../types.js';
-import type { JarCookie } from '../proxy/cookie-jar.js';
+import { domainMatches, type JarCookie } from '../proxy/cookie-jar.js';
 
 export interface UserRow {
   id: string;
@@ -477,11 +477,18 @@ export async function loadJar(
   db: D1Database,
   key: { userId: string; profileId: string; domain: string },
 ): Promise<JarCookie[]> {
+  // A cookie set with `Domain=wikipedia.org` from `en.wikipedia.org` must be
+  // sent on later `en.wikipedia.org` requests, so matching is by domain suffix
+  // rather than exact hostname. The set is per (user, profile) and small, so
+  // the suffix test runs in JS instead of SQL.
   const { results } = await db
-    .prepare('SELECT * FROM cookie_jar WHERE user_id = ? AND profile_id = ? AND domain = ?')
-    .bind(key.userId, key.profileId, key.domain)
+    .prepare('SELECT * FROM cookie_jar WHERE user_id = ? AND profile_id = ?')
+    .bind(key.userId, key.profileId)
     .all<CookieJarRow>();
-  return (results ?? []).map(rowToJarCookie);
+  const hostname = key.domain.toLowerCase();
+  return (results ?? [])
+    .filter((row) => domainMatches(hostname, row.domain))
+    .map(rowToJarCookie);
 }
 
 export async function saveJar(
@@ -490,10 +497,34 @@ export async function saveJar(
   cookies: readonly JarCookie[],
 ): Promise<void> {
   const stamp = now();
+  // `cookies` is the complete desired state for this key. Rows may live under a
+  // parent domain (`example.com`) while the key is a subdomain
+  // (`en.example.com`), so the delete must reach the key *and every parent of
+  // it* — otherwise a stale parent-domain row survives and the INSERT violates
+  // the primary key, 500-ing the request.
+  //
+  // The suffix chain is built in JS rather than matched with SQL `LIKE`: a
+  // hostname may legitimately contain `_`, which `LIKE` treats as a wildcard,
+  // and an over-broad delete would silently drop another site's cookies.
+  // Single-label suffixes (`com`) are excluded — `parseSetCookie` refuses to
+  // store them, so they can only be legacy junk, and deleting them could reach
+  // rows this request has no business touching.
+  const domains = new Set<string>([key.domain.toLowerCase()]);
+  for (const cookie of cookies) domains.add(cookie.domain.toLowerCase());
+  const labels = key.domain.toLowerCase().split('.');
+  for (let i = 1; i < labels.length - 1; i += 1) {
+    domains.add(labels.slice(i).join('.'));
+  }
+  const domainList = [...domains];
+
   const statements: D1PreparedStatement[] = [
     db
-      .prepare('DELETE FROM cookie_jar WHERE user_id = ? AND profile_id = ? AND domain = ?')
-      .bind(key.userId, key.profileId, key.domain),
+      .prepare(
+        `DELETE FROM cookie_jar
+          WHERE user_id = ? AND profile_id = ?
+            AND domain IN (${domainList.map(() => '?').join(', ')})`,
+      )
+      .bind(key.userId, key.profileId, ...domainList),
   ];
   for (const cookie of cookies) {
     statements.push(
@@ -501,12 +532,21 @@ export async function saveJar(
         .prepare(
           `INSERT INTO cookie_jar
              (user_id, profile_id, domain, name, value, path, expires_at, http_only, secure, same_site, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (user_id, profile_id, domain, name, path) DO UPDATE SET
+             value = excluded.value,
+             expires_at = excluded.expires_at,
+             http_only = excluded.http_only,
+             secure = excluded.secure,
+             same_site = excluded.same_site,
+             updated_at = excluded.updated_at`,
         )
         .bind(
           key.userId,
           key.profileId,
-          key.domain,
+          // The cookie's own domain, not the request host: a `Domain=` cookie is
+          // stored under that domain so it is shared across its subdomains.
+          cookie.domain.toLowerCase(),
           cookie.name,
           cookie.value,
           cookie.path,

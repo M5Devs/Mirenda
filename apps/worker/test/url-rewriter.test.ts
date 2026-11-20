@@ -1,12 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import {
+  buildGetFormUrl,
+  decodeHtmlEntities,
+  extractProxyTarget,
   isUrlAttribute,
   parseProxyTarget,
   proxify,
+  resolveAttributeUrl,
   resolveTargetUrl,
   rewriteAttribute,
+  rewriteCssImports,
   rewriteCssUrls,
   rewriteSrcset,
+  rewriteStylesheet,
   rewriteUrlAttribute,
   targetDomainOf,
 } from '../src/proxy/url-rewriter.js';
@@ -181,6 +187,128 @@ describe('parseProxyTarget', () => {
 
   it('rejects embedded credentials', () => {
     expect(parseProxyTarget('https://user:pass@example.com/')).toBeNull();
+  });
+});
+
+describe('decodeHtmlEntities', () => {
+  it('decodes the ampersand that appears in every multi-param URL', () => {
+    expect(decodeHtmlEntities('/w/load.php?lang=en&amp;modules=x')).toBe('/w/load.php?lang=en&modules=x');
+  });
+
+  it('leaves a bare ampersand alone', () => {
+    expect(decodeHtmlEntities('/a?b=1&c=2')).toBe('/a?b=1&c=2');
+  });
+
+  it('decodes numeric references for printable ASCII only', () => {
+    expect(decodeHtmlEntities('a&#47;b')).toBe('a/b');
+    expect(decodeHtmlEntities('a&#x2F;b')).toBe('a/b');
+    // A control character must not be introduced into a URL.
+    expect(decodeHtmlEntities('a&#1;b')).toBe('a&#1;b');
+  });
+
+  it('leaves unknown named entities untouched', () => {
+    expect(decodeHtmlEntities('a&nosuchentity;b')).toBe('a&nosuchentity;b');
+  });
+});
+
+describe('resolveAttributeUrl', () => {
+  it('decodes entities before resolving so query params survive', () => {
+    const resolved = resolveAttributeUrl(
+      '/w/load.php?lang=en&amp;modules=site.styles',
+      'https://en.wikipedia.org/wiki/Cloudflare',
+    );
+    expect(resolved).toBe('https://en.wikipedia.org/w/load.php?lang=en&modules=site.styles');
+  });
+
+  it('rewrites a stylesheet link to a single readable proxied URL', () => {
+    const proxied = rewriteUrlAttribute(
+      '/w/load.php?lang=en&amp;modules=site.styles&amp;only=styles',
+      { pageUrl: 'https://en.wikipedia.org/wiki/Cloudflare', profileId: 'p1' },
+    );
+    const target = targetOf(proxied);
+    expect(target).toBe('https://en.wikipedia.org/w/load.php?lang=en&modules=site.styles&only=styles');
+    // The `&amp;` must not have been double-encoded into `%26amp%3B`.
+    expect(proxied).not.toContain('amp%3B');
+    expect(proxied).not.toContain('amp;');
+  });
+});
+
+describe('rewriteCssImports', () => {
+  it('rewrites the quoted @import form', () => {
+    const css = '@import "theme.css";';
+    const out = rewriteCssImports(css, ctx);
+    expect(targetOf(out.slice(out.indexOf('/proxy')))).toBe('https://example.com/dir/theme.css');
+  });
+
+  it('preserves a trailing media query', () => {
+    const out = rewriteCssImports('@import "/a.css" screen and (min-width: 40em);', ctx);
+    expect(out).toContain('screen and (min-width: 40em)');
+  });
+
+  it('leaves the url() form to rewriteCssUrls', () => {
+    const out = rewriteCssImports('@import url("/a.css");', ctx);
+    expect(out).toBe('@import url("/a.css");');
+  });
+});
+
+describe('rewriteStylesheet', () => {
+  it('rewrites both @import and url() in one pass', () => {
+    const out = rewriteStylesheet('@import "a.css";\nbody{background:url(/b.png)}', ctx);
+    expect(out).toContain('url(/proxy');
+    expect(out).toContain('@import "/proxy');
+    expect(targetOf(out.slice(out.indexOf('@import') + 8))).toBe('https://example.com/dir/a.css');
+  });
+
+  it('does not decode CSS entities, which are literal in a stylesheet', () => {
+    const out = rewriteStylesheet('body{background:url(/a.png?x=1&amp;y=2)}', ctx);
+    // `&amp;` is not an HTML entity here; it stays as the server sent it.
+    expect(targetOf(out.slice(out.indexOf('/proxy')))).toBe(
+      'https://example.com/a.png?x=1&amp;y=2',
+    );
+  });
+});
+
+describe('extractProxyTarget', () => {
+  it('recovers the upstream URL from a proxied value', () => {
+    expect(extractProxyTarget('/proxy?url=https%3A%2F%2Fa.test%2Fx&profileId=p')).toBe(
+      'https://a.test/x',
+    );
+  });
+
+  it('returns null for a non-proxy value', () => {
+    expect(extractProxyTarget('/search?q=1')).toBeNull();
+  });
+});
+
+describe('buildGetFormUrl', () => {
+  const page = 'https://www.google.com/';
+
+  it('folds the fields into the target query string', () => {
+    const out = buildGetFormUrl('/search', page, [['q', 'cloudflare workers']]);
+    expect(out).toBe('https://www.google.com/search?q=cloudflare+workers');
+  });
+
+  it('merges with a query the action already carries', () => {
+    const out = buildGetFormUrl('/search?hl=en', page, [['q', 'x']]);
+    expect(out).toBe('https://www.google.com/search?hl=en&q=x');
+  });
+
+  it('uses the current page when the action is empty', () => {
+    const out = buildGetFormUrl('', 'https://a.test/find?q=old', [['q', 'new']]);
+    expect(out).toBe('https://a.test/find?q=old&q=new');
+  });
+
+  it('unwraps an already-proxied action instead of nesting it', () => {
+    const proxied = proxify('https://www.google.com/search', {
+      pageUrl: page,
+      profileId: 'p1',
+    });
+    const out = buildGetFormUrl(proxied, page, [['q', 'hi']]);
+    expect(out).toBe('https://www.google.com/search?q=hi');
+  });
+
+  it('returns null for an action that cannot be resolved', () => {
+    expect(buildGetFormUrl('javascript:void(0)', page, [['q', 'x']])).toBeNull();
   });
 });
 

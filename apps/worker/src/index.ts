@@ -34,7 +34,7 @@ export default {
     const url = new URL(request.url);
     const role = resolveRole(env);
 
-    if (request.method === 'OPTIONS') return preflight(request, env);
+    if (request.method === 'OPTIONS') return preflight(request, env, url);
 
     const router = new Router(
       buildRoutes({
@@ -97,12 +97,22 @@ export default {
 
     try {
       const response = await Router.handler(match)(context);
-      return withCors(withSecurityHeaders(response), request, env);
+      const shaped = withSecurityHeaders(response);
+      // `/proxy` is authorised by its scoped `pt` token, never by a cookie, so a
+      // `null` origin is safe to reflect there. Without this the in-page runtime's
+      // `fetch`/XHR — always cross-origin inside an opaque-origin frame — would be
+      // blocked by the CORS check before it could reach the proxy.
+      if (url.pathname === '/proxy') {
+        return withProxyCors(shaped, request);
+      }
+      return withCors(shaped, request, env);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'unexpected error';
       // Log the message only; request bodies and secrets are never echoed.
       console.error('route failure', { path: url.pathname, message });
-      return withCors(withSecurityHeaders(fail(500, 'internal error')), request, env);
+      const failure = withSecurityHeaders(fail(500, 'internal error'));
+      if (url.pathname === '/proxy') return withProxyCors(failure, request);
+      return withCors(failure, request, env);
     }
   },
 } satisfies ExportedHandler<Env>;
@@ -149,8 +159,40 @@ function withCors(response: Response, request: Request, env: Env): Response {
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
-function preflight(request: Request, env: Env): Response {
+/**
+ * CORS for `/proxy` only.
+ *
+ * A proxied document lives in an `allow-scripts`-but-not-`allow-same-origin`
+ * iframe, so its `Origin` is `null` and its `fetch`/XHR calls are always
+ * cross-origin. `/proxy` never authenticates with a cookie — it requires the
+ * scoped `pt` token — so reflecting any origin here cannot leak a session. The
+ * alternative (a strict allowlist) would break every in-page network call.
+ */
+function withProxyCors(response: Response, request: Request): Response {
+  const origin = request.headers.get('origin');
+  if (!origin) return response;
+  const headers = new Headers(response.headers);
+  headers.set('access-control-allow-origin', origin);
+  headers.append('vary', 'origin');
+  // No `allow-credentials`: the token travels in the query string, and allowing
+  // credentials would let a hostile page ride a logged-in session cookie.
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+function preflight(request: Request, env: Env, url: URL): Response {
   const origin = request.headers.get('origin') ?? '';
+  // `/proxy` accepts any origin (token-authenticated, see `withProxyCors`).
+  if (url.pathname === '/proxy') {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        'access-control-allow-origin': origin || '*',
+        'access-control-allow-methods': 'GET,POST,OPTIONS',
+        'access-control-allow-headers': 'content-type, x-mirenda-proxy-token',
+        vary: 'origin',
+      },
+    });
+  }
   const allowed = parseOrigins(env.ALLOWED_ORIGINS);
   const headers = new Headers({ 'access-control-allow-methods': 'GET,POST,PATCH,DELETE,OPTIONS' });
   headers.set('access-control-allow-headers', 'content-type, x-mirenda-proxy-token');

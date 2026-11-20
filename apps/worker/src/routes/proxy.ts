@@ -16,7 +16,7 @@ import { buildHandlers, createRewriteState } from '../proxy/rewrite-handlers.js'
 import {
   parseProxyTarget,
   PROXY_PATH,
-  rewriteCssUrls,
+  rewriteStylesheet,
   targetDomainOf,
   type RewriteContext,
 } from '../proxy/url-rewriter.js';
@@ -253,7 +253,7 @@ export function createProxyHandler(deps: ProxyDeps) {
     if (!isHtml) {
       if (isCss) {
         const css = await upstream.text();
-        return new Response(rewriteCssUrls(css, rewriteCtx), {
+        return new Response(rewriteStylesheet(css, rewriteCtx), {
           status: upstream.status,
           headers: responseHeaders,
         });
@@ -267,6 +267,7 @@ export function createProxyHandler(deps: ProxyDeps) {
     const rewritten = new HTMLRewriter()
       .on('*', handlers.attribute)
       .on('style', handlers.styleText)
+      .on('head', handlers.head)
       .on('body', handlers.body)
       .transform(
         new Response(upstream.body, {
