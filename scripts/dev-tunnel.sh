@@ -32,9 +32,11 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 wait_for_url() {
-  local url="$1" name="$2" tries="${3:-60}"
+  local url="$1" name="$2" tries="${3:-90}"
   for _ in $(seq "$tries"); do
-    if curl -fsS -o /dev/null --max-time 2 "$url" 2>/dev/null; then return 0; fi
+    # Any HTTP status counts as ready: `/proxy` without params answers 4xx by
+    # design, so only a connection failure means the Worker is not listening.
+    if curl -s -o /dev/null --max-time 2 "$url" 2>/dev/null; then return 0; fi
     sleep 1
   done
   echo "timed out waiting for $name at $url" >&2
@@ -69,8 +71,12 @@ pids+=($!)
 SANDBOX_URL="$(tunnel_url "$LOG_DIR/tunnel-sandbox.log")" || { echo "sandbox tunnel failed" >&2; exit 1; }
 
 # The Workers must know their own public origins, so start them only now.
+# `wrangler.toml` lives in `apps/worker` and its asset paths are relative to
+# that directory, so the dev servers must run from there.
 echo "==> starting workers with the tunnel origins"
-npx wrangler dev --env app --port "$APP_PORT" --local \
+cd "$ROOT/apps/worker"
+
+npx wrangler dev --env app --port "$APP_PORT" --local --inspector-port "${APP_INSPECTOR_PORT:-9230}" \
   --var PROXY_TOKEN_SECRET:"$PROXY_TOKEN_SECRET" \
   --var APP_ORIGIN:"$APP_URL" \
   --var SANDBOX_ORIGIN:"$SANDBOX_URL" \
@@ -78,7 +84,7 @@ npx wrangler dev --env app --port "$APP_PORT" --local \
   >"$LOG_DIR/w-app.log" 2>&1 &
 pids+=($!)
 
-npx wrangler dev --env sandbox --port "$SANDBOX_PORT" --local \
+npx wrangler dev --env sandbox --port "$SANDBOX_PORT" --local --inspector-port "${SANDBOX_INSPECTOR_PORT:-9231}" \
   --var PROXY_TOKEN_SECRET:"$PROXY_TOKEN_SECRET" \
   --var APP_ORIGIN:"$APP_URL" \
   --var SANDBOX_ORIGIN:"$SANDBOX_URL" \
